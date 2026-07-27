@@ -360,6 +360,8 @@ struct WorkspaceView: View {
             "Built-in effect"
         case .audioUnit(let descriptor):
             descriptor.manufacturerName
+        case .vst3(let descriptor):
+            descriptor.vendor
         }
     }
 
@@ -442,7 +444,7 @@ struct WorkspaceView: View {
                 && session.nodes[index].isEnabled != enabled
                 && {
                     switch session.nodes[index].nodeType {
-                    case .audioUnit, .builtInEffect, .combine, .recorder:
+                    case .audioUnit, .vst3, .builtInEffect, .combine, .recorder:
                         return true
                     case .inputDevice,
                          .applicationAudioInput,

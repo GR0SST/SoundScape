@@ -18,6 +18,7 @@ struct SoundScapeApp: App {
     private var appDelegate
     @StateObject private var store = SessionStore()
     @StateObject private var audioUnitCatalog = AudioUnitCatalog()
+    @StateObject private var vst3Catalog = VST3Catalog()
     @StateObject private var audioEnginePool = AudioEnginePool()
     @StateObject private var settings = AppSettings()
 
@@ -26,6 +27,7 @@ struct SoundScapeApp: App {
             RootView()
                 .environmentObject(store)
                 .environmentObject(audioUnitCatalog)
+                .environmentObject(vst3Catalog)
                 .environmentObject(audioEnginePool)
                 .environmentObject(settings)
                 .preferredColorScheme(.dark)

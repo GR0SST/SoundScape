@@ -10,6 +10,7 @@ built with SwiftUI, AVFAudio, Core Audio, ScreenCaptureKit, and SQLite.
 - Hardware microphone and output-device selection
 - Per-application and system-wide audio capture
 - Audio Unit discovery, hosting, parameters, and custom plug-in interfaces
+- VST® 3 effect discovery, hosting, parameters, and realtime processing
 - Built-in EQ, balance, filters, compression, volume, pan, and combining
 - Recorder nodes for WAV and CAF output
 - Multiple inputs and outputs
@@ -17,7 +18,7 @@ built with SwiftUI, AVFAudio, Core Audio, ScreenCaptureKit, and SQLite.
 - Copy, paste, duplicate, undo, deletion, and drag-and-drop block creation
 
 SoundScape is under active development. Save work before testing third-party
-Audio Units, as plug-ins run inside the application process.
+Audio Units or VST3 plug-ins, as plug-ins run inside the application process.
 
 ## Requirements
 
@@ -49,6 +50,9 @@ the executable's code signature changes.
 
 - `Sources/SoundScape` — application UI, graph model, audio engine, and storage
 - `Sources/CSQLite` — SQLite system-library shim
+- `Sources/CVST3Host` — VST3 scanner, host bridge, and Steinberg C API
 - `Resources` — application icon assets
 - `Scripts` — packaging, device auditing, and audio-render diagnostics
 - `Support` — application metadata and entitlements
+
+VST is a registered trademark of Steinberg Media Technologies GmbH.

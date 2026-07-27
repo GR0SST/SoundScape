@@ -201,6 +201,17 @@ struct AudioUnitDescriptor: Identifiable, Codable, Hashable {
     }
 }
 
+struct VST3Descriptor: Identifiable, Codable, Hashable, Sendable {
+    let modulePath: String
+    let classID: String
+    let name: String
+    let vendor: String
+    let version: String
+    let subcategories: String
+
+    var id: String { classID }
+}
+
 enum AudioNodeType: Codable, Hashable {
     case inputDevice
     case applicationAudioInput
@@ -210,6 +221,7 @@ enum AudioNodeType: Codable, Hashable {
     case combine
     case builtInEffect(BuiltInEffectType)
     case audioUnit(AudioUnitDescriptor)
+    case vst3(VST3Descriptor)
 
     var stableID: String {
         switch self {
@@ -221,6 +233,7 @@ enum AudioNodeType: Codable, Hashable {
         case .combine: "combine"
         case .builtInEffect(let effect): "built-in-\(effect.rawValue)"
         case .audioUnit(let descriptor): "audio-unit-\(descriptor.id)"
+        case .vst3(let descriptor): "vst3-\(descriptor.id)"
         }
     }
 }
@@ -255,6 +268,13 @@ struct AudioNode: Identifiable, Hashable {
             return "macwindow"
         }
         return icon
+    }
+
+    var categoryLabel: String {
+        if case .vst3 = nodeType {
+            return "VST3"
+        }
+        return kind.label
     }
 
     static func == (lhs: AudioNode, rhs: AudioNode) -> Bool {

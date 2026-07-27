@@ -218,7 +218,7 @@ struct NodeGraphView: View {
                 .help("Click to inspect · drag to move")
                 .accessibilityElement(children: .combine)
                 .accessibilityAddTraits(.isButton)
-                .accessibilityLabel("\(node.title), \(node.kind.label)")
+                .accessibilityLabel("\(node.title), \(node.categoryLabel)")
                 .accessibilityAction {
                     selectNodeWithClick(node.id)
                 }
@@ -886,7 +886,7 @@ struct NodeGraphView: View {
                 return nil
             }
             switch candidate.nodeType {
-            case .audioUnit, .builtInEffect, .combine, .recorder:
+            case .audioUnit, .vst3, .builtInEffect, .combine, .recorder:
                 return candidate.id
             case .inputDevice,
                  .applicationAudioInput,
@@ -1174,7 +1174,7 @@ private struct AudioNodeView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text(node.kind.label)
+                Text(node.categoryLabel)
                     .font(.system(size: 8.5, weight: .black))
                     .tracking(0.8)
                     .foregroundStyle(accent)

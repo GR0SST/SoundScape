@@ -1,0 +1,4 @@
+module CVST3Host {
+    umbrella header "CVST3Host.h"
+    export *
+}

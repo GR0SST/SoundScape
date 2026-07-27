@@ -1,6 +1,7 @@
 import AppKit
 import AudioToolbox
 import AVFAudio
+import CVST3Host
 import CoreAudioKit
 import Foundation
 
@@ -59,6 +60,7 @@ final class AudioEngineController: ObservableObject {
     private var outputEngineActive = false
     private var processingEngineOutputActive = false
     private var hostedUnits: [String: AVAudioUnit] = [:]
+    private var hostedVST3Plugins: [String: SSVST3Plugin] = [:]
     private var hostedBuiltInNodes: [String: AVAudioNode] = [:]
     private var hostedCombineMixers: [String: AVAudioMixerNode] = [:]
     private var hostedCombineInputNodes: [String: AVAudioMixerNode] = [:]
@@ -488,6 +490,21 @@ final class AudioEngineController: ObservableObject {
     }
 
     func setParameter(nodeID: String, address: AUParameterAddress, value: AUValue) {
+        if let vst3 = hostedVST3Plugins[nodeID] {
+            guard vst3.setNormalizedValue(
+                Double(value),
+                parameterID: UInt32(truncatingIfNeeded: address)
+            ) else {
+                return
+            }
+            if let index = parametersByNodeID[nodeID]?.firstIndex(where: {
+                $0.address == address
+            }) {
+                parametersByNodeID[nodeID]?[index].value = value
+            }
+            return
+        }
+
         guard let parameter = hostedUnits[nodeID]?
             .auAudioUnit
             .parameterTree?
@@ -614,6 +631,9 @@ final class AudioEngineController: ObservableObject {
     func capturedAudioUnitStates() -> [String: Data] {
         var result: [String: Data] = [:]
         for (nodeID, unit) in hostedUnits {
+            if hostedVST3Plugins[nodeID] != nil {
+                continue
+            }
             guard let state = unit.auAudioUnit.fullState,
                   PropertyListSerialization.propertyList(
                     state,
@@ -628,6 +648,11 @@ final class AudioEngineController: ObservableObject {
             }
             result[nodeID] = data
         }
+        for (nodeID, plugin) in hostedVST3Plugins {
+            if let state = plugin.stateData() {
+                result[nodeID] = state
+            }
+        }
         return result
     }
 
@@ -636,16 +661,19 @@ final class AudioEngineController: ObservableObject {
     }
 
     func prepareForInspection(_ node: AudioNode) async {
-        guard case .audioUnit(let descriptor) = node.nodeType else {
-            return
-        }
-
         if let existing = hostedUnits[node.id] {
-            if descriptor.hasCustomView {
+            if case .audioUnit(let descriptor) = node.nodeType,
+               descriptor.hasCustomView {
                 requestCustomViewController(
                     nodeID: node.id,
                     audioUnit: existing,
                     generation: audioUnitGeneration
+                )
+            } else if case .vst3 = node.nodeType,
+                      let plugin = hostedVST3Plugins[node.id] {
+                requestVST3CustomViewController(
+                    nodeID: node.id,
+                    plugin: plugin
                 )
             }
             return
@@ -660,18 +688,37 @@ final class AudioEngineController: ObservableObject {
         defer { loadingInspectorNodeIDs.remove(node.id) }
 
         do {
-            let audioUnit = try await instantiateConfiguredUnit(
-                descriptor: descriptor,
-                node: node
-            )
-            hostedUnits[node.id] = audioUnit
-            parametersByNodeID[node.id] = parameterModels(for: audioUnit)
-            if descriptor.hasCustomView {
-                requestCustomViewController(
-                    nodeID: node.id,
-                    audioUnit: audioUnit,
-                    generation: audioUnitGeneration
+            switch node.nodeType {
+            case .audioUnit(let descriptor):
+                let audioUnit = try await instantiateConfiguredUnit(
+                    descriptor: descriptor,
+                    node: node
                 )
+                hostedUnits[node.id] = audioUnit
+                parametersByNodeID[node.id] = parameterModels(for: audioUnit)
+                if descriptor.hasCustomView {
+                    requestCustomViewController(
+                        nodeID: node.id,
+                        audioUnit: audioUnit,
+                        generation: audioUnitGeneration
+                    )
+                }
+            case .vst3(let descriptor):
+                let hosted = try await instantiateConfiguredVST3(
+                    descriptor: descriptor,
+                    node: node
+                )
+                hostedUnits[node.id] = hosted.audioUnit
+                hostedVST3Plugins[node.id] = hosted.plugin
+                parametersByNodeID[node.id] = parameterModels(
+                    for: hosted.plugin
+                )
+                requestVST3CustomViewController(
+                    nodeID: node.id,
+                    plugin: hosted.plugin
+                )
+            default:
+                return
             }
         } catch {
             inspectorErrorsByNodeID[node.id] = error.localizedDescription
@@ -848,6 +895,30 @@ final class AudioEngineController: ObservableObject {
                 if node.isEnabled {
                     enabledUnits.append((node, audioUnit))
                 }
+            case .vst3(let descriptor):
+                statusMessage = "Loading \(descriptor.name)…"
+                let audioUnit: AVAudioUnit
+                let plugin: SSVST3Plugin
+                if let existingUnit = hostedUnits[node.id],
+                   let existingPlugin = hostedVST3Plugins[node.id] {
+                    audioUnit = existingUnit
+                    plugin = existingPlugin
+                    applyNodeSettings(node, to: plugin)
+                } else {
+                    let hosted = try await instantiateConfiguredVST3(
+                        descriptor: descriptor,
+                        node: node
+                    )
+                    audioUnit = hosted.audioUnit
+                    plugin = hosted.plugin
+                    try Task.checkCancellation()
+                }
+                hostedUnits[node.id] = audioUnit
+                hostedVST3Plugins[node.id] = plugin
+                parametersByNodeID[node.id] = parameterModels(for: plugin)
+                if node.isEnabled {
+                    enabledUnits.append((node, audioUnit))
+                }
             case .recorder:
                 recorderErrorsByNodeID[node.id] = nil
                 continue
@@ -937,7 +1008,7 @@ final class AudioEngineController: ObservableObject {
 
         for node in plan.nodes {
             switch node.nodeType {
-            case .audioUnit:
+            case .audioUnit, .vst3:
                 if node.isEnabled {
                     guard let audioUnit = hostedUnits[node.id] else {
                         throw AudioGraphError.unsupportedNode(node.title)
@@ -1860,6 +1931,45 @@ final class AudioEngineController: ObservableObject {
         return audioUnit
     }
 
+    private func instantiateConfiguredVST3(
+        descriptor: VST3Descriptor,
+        node: AudioNode
+    ) async throws -> (audioUnit: AVAudioUnit, plugin: SSVST3Plugin) {
+        let plugin = try SSVST3Plugin(
+            modulePath: descriptor.modulePath,
+            classID: descriptor.classID
+        )
+        if let state = node.audioUnitState {
+            try? plugin.loadStateData(state)
+        }
+        applyNodeSettings(node, to: plugin)
+
+        VST3AudioUnit.registerIfNeeded()
+        let audioUnit = try await AVAudioUnit.instantiate(
+            with: VST3AudioUnit.componentDescription,
+            options: [.loadInProcess]
+        )
+        try Task.checkCancellation()
+        guard let wrapper = audioUnit.auAudioUnit as? VST3AudioUnit else {
+            throw VST3HostError.missingPlugin
+        }
+        wrapper.configure(plugin: plugin)
+        return (audioUnit, plugin)
+    }
+
+    private func applyNodeSettings(
+        _ node: AudioNode,
+        to plugin: SSVST3Plugin
+    ) {
+        for (addressString, value) in node.parameterValues {
+            guard let address = UInt32(addressString) else { continue }
+            _ = plugin.setNormalizedValue(
+                value,
+                parameterID: address
+            )
+        }
+    }
+
     private func applyNodeSettings(
         _ node: AudioNode,
         to audioUnit: AVAudioUnit,
@@ -1937,16 +2047,46 @@ final class AudioEngineController: ObservableObject {
         }
     }
 
+    private func requestVST3CustomViewController(
+        nodeID: String,
+        plugin: SSVST3Plugin
+    ) {
+        guard customViewsByNodeID[nodeID] == nil,
+              !loadingCustomViewNodeIDs.contains(nodeID) else {
+            return
+        }
+
+        loadingCustomViewNodeIDs.insert(nodeID)
+        customViewErrorsByNodeID[nodeID] = nil
+        defer { loadingCustomViewNodeIDs.remove(nodeID) }
+
+        do {
+            let viewController = try plugin.createViewController()
+            viewController.loadView()
+            customViewsByNodeID[nodeID] = HostedAUCustomView(
+                viewController: viewController,
+                intrinsicSize: intrinsicCustomViewSize(viewController)
+            )
+        } catch {
+            customViewErrorsByNodeID[nodeID] = error.localizedDescription
+        }
+    }
+
     private func discardHostedUnitsMissing(from session: AudioSession) {
         let validNodeIDs = Set(session.nodes.compactMap { node -> String? in
-            guard case .audioUnit = node.nodeType else { return nil }
-            return node.id
+            switch node.nodeType {
+            case .audioUnit, .vst3:
+                return node.id
+            default:
+                return nil
+            }
         })
         let removedNodeIDs = Set(hostedUnits.keys).subtracting(validNodeIDs)
         guard !removedNodeIDs.isEmpty else { return }
 
         for nodeID in removedNodeIDs {
             hostedUnits[nodeID] = nil
+            hostedVST3Plugins[nodeID] = nil
             parametersByNodeID[nodeID] = nil
             inspectorErrorsByNodeID[nodeID] = nil
             loadingInspectorNodeIDs.remove(nodeID)
@@ -1992,6 +2132,28 @@ final class AudioEngineController: ObservableObject {
         }
         .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         ?? []
+    }
+
+    private func parameterModels(
+        for plugin: SSVST3Plugin
+    ) -> [HostedAUParameter] {
+        plugin.parameters.map { parameter in
+            HostedAUParameter(
+                address: AUParameterAddress(parameter.parameterID),
+                name: parameter.name,
+                minimum: 0,
+                maximum: 1,
+                value: AUValue(parameter.normalizedValue),
+                unit: parameter.stepCount == 1 ? .boolean : .generic,
+                unitName: parameter.units,
+                valueStrings: [],
+                isWritable: parameter.isWritable
+            )
+        }
+        .sorted {
+            $0.name.localizedCaseInsensitiveCompare($1.name)
+                == .orderedAscending
+        }
     }
 
     private func graphPlan(in session: AudioSession) throws -> AudioGraphPlan {

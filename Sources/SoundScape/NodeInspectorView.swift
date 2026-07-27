@@ -44,6 +44,8 @@ struct NodeInspectorView: View {
                         builtInControls(effect)
                     case .audioUnit(let descriptor):
                         audioUnitControls(descriptor)
+                    case .vst3(let descriptor):
+                        vst3Controls(descriptor)
                     }
 
                     if case .recorder = node.nodeType {
@@ -1142,6 +1144,32 @@ struct NodeInspectorView: View {
         }
     }
 
+    private func vst3Controls(
+        _ descriptor: VST3Descriptor
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("VST3")
+
+            VStack(alignment: .leading, spacing: 11) {
+                detailRow(
+                    "Manufacturer",
+                    descriptor.vendor.isEmpty ? "Unknown" : descriptor.vendor
+                )
+                if !descriptor.version.isEmpty {
+                    detailRow("Version", descriptor.version)
+                }
+                detailRow("Component", descriptor.classID)
+
+                Divider().overlay(AppTheme.line)
+                hostBypassControl
+            }
+            .cardStyle()
+
+            embeddedPluginSection
+            parameterControls
+        }
+    }
+
     private var hostBypassControl: some View {
         HStack {
             Text("Node enabled")
@@ -1180,10 +1208,12 @@ struct NodeInspectorView: View {
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(AppTheme.secondaryText)
                 }
+                .padding(13)
+                .frame(maxWidth: .infinity)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .padding(13)
+            .contentShape(Rectangle())
             .accessibilityLabel(
                 pluginViewExpanded
                     ? "Collapse plug-in interface"

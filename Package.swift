@@ -15,11 +15,26 @@ let package = Package(
             name: "CSQLite",
             path: "Sources/CSQLite"
         ),
+        .target(
+            name: "CVST3Host",
+            path: "Sources/CVST3Host",
+            publicHeadersPath: "include",
+            cSettings: [
+                .headerSearchPath("Vendor"),
+                .unsafeFlags(["-fobjc-arc"])
+            ],
+            linkerSettings: [
+                .linkedFramework("AppKit"),
+                .linkedFramework("CoreAudio"),
+                .linkedFramework("Foundation")
+            ]
+        ),
         .executableTarget(
             name: "SoundScape",
-            dependencies: ["CSQLite"],
+            dependencies: ["CSQLite", "CVST3Host"],
             path: "Sources/SoundScape"
         )
     ],
-    swiftLanguageModes: [.v5]
+    swiftLanguageModes: [.v5],
+    cLanguageStandard: .c11
 )

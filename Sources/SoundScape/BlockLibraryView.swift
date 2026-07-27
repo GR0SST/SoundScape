@@ -2,6 +2,7 @@ import SwiftUI
 
 struct BlockLibraryView: View {
     @EnvironmentObject private var audioUnitCatalog: AudioUnitCatalog
+    @EnvironmentObject private var vst3Catalog: VST3Catalog
     @Binding var searchText: String
     let addItem: (LibraryItem) -> Void
     let dragChanged: (LibraryItem, CGPoint) -> Void
@@ -10,7 +11,8 @@ struct BlockLibraryView: View {
     @State private var draggingItemID: String?
     @State private var expandedSections: Set<String> = [
         "built-in",
-        "audio-units"
+        "audio-units",
+        "vst3"
     ]
 
     private var librarySections: [LibrarySection] {
@@ -23,6 +25,15 @@ struct BlockLibraryView: View {
                 nodeType: .audioUnit(descriptor)
             )
         }
+        let vst3Plugins = vst3Catalog.components.map { descriptor in
+            LibraryItem(
+                id: "vst3-\(descriptor.id)",
+                title: descriptor.name,
+                icon: "waveform.badge.plus",
+                kind: .processor,
+                nodeType: .vst3(descriptor)
+            )
+        }
 
         return [
             DemoContent.builtInLibrarySection,
@@ -30,6 +41,11 @@ struct BlockLibraryView: View {
                 id: "audio-units",
                 title: "Audio Units",
                 items: audioUnits
+            ),
+            LibrarySection(
+                id: "vst3",
+                title: "VST3",
+                items: vst3Plugins
             )
         ]
     }
@@ -40,7 +56,9 @@ struct BlockLibraryView: View {
                 searchText.isEmpty ||
                 item.title.localizedCaseInsensitiveContains(searchText)
             }
-            if items.isEmpty && (section.id != "audio-units" || !searchText.isEmpty) {
+            if items.isEmpty &&
+                (!["audio-units", "vst3"].contains(section.id)
+                    || !searchText.isEmpty) {
                 return nil
             }
             return LibrarySection(id: section.id, title: section.title, items: items)
@@ -56,6 +74,7 @@ struct BlockLibraryView: View {
                     Spacer()
                     Button {
                         audioUnitCatalog.refresh()
+                        vst3Catalog.refresh()
                     } label: {
                         Image(
                             systemName: audioUnitCatalog.isScanning
@@ -65,8 +84,8 @@ struct BlockLibraryView: View {
                         .foregroundStyle(AppTheme.secondaryText)
                     }
                     .buttonStyle(.plain)
-                    .help("Rescan installed Audio Units")
-                    .accessibilityLabel("Rescan Audio Units")
+                    .help("Rescan installed Audio Units and VST3 plug-ins")
+                    .accessibilityLabel("Rescan audio plug-ins")
                 }
 
                 HStack(spacing: 8) {
@@ -156,17 +175,15 @@ struct BlockLibraryView: View {
                 }
                 .foregroundStyle(AppTheme.secondaryText)
                 .padding(.horizontal, 15)
-                .frame(height: 30)
+                .frame(maxWidth: .infinity, minHeight: 30)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .contentShape(Rectangle())
 
             if expandedSections.contains(section.id) {
                 if section.items.isEmpty {
-                    Text(
-                        audioUnitCatalog.isScanning
-                            ? "Scanning installed plug-ins…"
-                            : "No compatible AU effects found"
-                    )
+                    Text(emptyMessage(for: section))
                     .font(.system(size: 10.5, weight: .medium))
                     .foregroundStyle(AppTheme.tertiaryText)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -179,6 +196,19 @@ struct BlockLibraryView: View {
                 }
             }
         }
+    }
+
+    private func emptyMessage(for section: LibrarySection) -> String {
+        if section.id == "vst3" {
+            if vst3Catalog.isScanning {
+                return "Scanning installed plug-ins…"
+            }
+            return vst3Catalog.errorMessage ?? "No compatible VST3 effects found"
+        }
+        if audioUnitCatalog.isScanning {
+            return "Scanning installed plug-ins…"
+        }
+        return audioUnitCatalog.errorMessage ?? "No compatible AU effects found"
     }
 
     private func libraryRow(_ item: LibraryItem) -> some View {
