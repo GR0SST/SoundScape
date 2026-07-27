@@ -7,6 +7,7 @@ struct NodeGraphView: View {
     @Binding var session: AudioSession
     @Binding var selectedNodeID: String?
     @Binding var selectedNodeIDs: Set<String>
+    let disconnectedDeviceNodeIDs: Set<String>
     @Binding var pendingLibraryDrop: LibraryDropRequest?
     @Binding var activeLibraryDrag: LibraryDragState?
     let removeNode: (String) -> Void
@@ -204,6 +205,8 @@ struct NodeGraphView: View {
                 AudioNodeView(
                     node: node,
                     isSelected: selectedNodeIDs.contains(node.id),
+                    isDeviceDisconnected:
+                        disconnectedDeviceNodeIDs.contains(node.id),
                     combineInputCount: audioInputConnections(to: node.id).count
                 )
                 .frame(width: size.width, height: size.height)
@@ -408,6 +411,13 @@ struct NodeGraphView: View {
         session.connections.filter { $0.to == nodeID && !$0.isReference }
     }
 
+    private func isAECNode(_ node: AudioNode) -> Bool {
+        if case .activeEchoCancellation = node.nodeType {
+            return true
+        }
+        return false
+    }
+
     // MARK: - Connections
 
     private var portLayer: some View {
@@ -434,7 +444,7 @@ struct NodeGraphView: View {
                     )
                 }
 
-                if node.id == "aec" || node.title == "Echo Cancellation" {
+                if isAECNode(node) {
                     inputPort(
                         for: node,
                         connectionID: session.connections.first {
@@ -582,6 +592,12 @@ struct NodeGraphView: View {
 
     private func connect(from sourceID: String, to targetID: String, isReference: Bool) {
         guard sourceID != targetID else { return }
+        if isReference {
+            guard session.nodes.first(where: { $0.id == sourceID })?.kind
+                == .source else {
+                return
+            }
+        }
 
         registerUndo()
         let isCombine = session.nodes.first(where: { $0.id == targetID }).map {
@@ -684,7 +700,7 @@ struct NodeGraphView: View {
             )
             candidates.append((InputTarget(nodeID: node.id, isReference: false), normalDistance))
 
-            if node.id == "aec" || node.title == "Echo Cancellation" {
+            if isAECNode(node) {
                 let referenceDistance = distance(
                     point,
                     inputPoint(
@@ -886,7 +902,12 @@ struct NodeGraphView: View {
                 return nil
             }
             switch candidate.nodeType {
-            case .audioUnit, .vst3, .builtInEffect, .combine, .recorder:
+            case .audioUnit,
+                 .vst3,
+                 .builtInEffect,
+                 .activeEchoCancellation,
+                 .combine,
+                 .recorder:
                 return candidate.id
             case .inputDevice,
                  .applicationAudioInput,
@@ -1158,6 +1179,7 @@ private struct LibraryNodeDragPreview: View {
                 nodeType: item.nodeType
             ),
             isSelected: true,
+            isDeviceDisconnected: false,
             combineInputCount: 0
         )
         .frame(width: 176, height: 132)
@@ -1168,21 +1190,36 @@ private struct LibraryNodeDragPreview: View {
 private struct AudioNodeView: View {
     let node: AudioNode
     let isSelected: Bool
+    let isDeviceDisconnected: Bool
     let combineInputCount: Int
     private let accent = DemoContent.cyan
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text(node.categoryLabel)
+                Text(
+                    isDeviceDisconnected
+                        ? "\(node.categoryLabel) · DISCONNECTED"
+                        : node.categoryLabel
+                )
                     .font(.system(size: 8.5, weight: .black))
                     .tracking(0.8)
-                    .foregroundStyle(accent)
+                    .foregroundStyle(
+                        isDeviceDisconnected
+                            ? DemoContent.orange
+                            : accent
+                    )
 
                 Spacer()
 
                 Circle()
-                    .fill(node.isEnabled ? DemoContent.mint : AppTheme.tertiaryText)
+                    .fill(
+                        isDeviceDisconnected
+                            ? DemoContent.orange
+                            : (node.isEnabled
+                                ? DemoContent.mint
+                                : AppTheme.tertiaryText)
+                    )
                     .frame(width: 6, height: 6)
             }
             .padding(.horizontal, 13)
@@ -1229,14 +1266,32 @@ private struct AudioNodeView: View {
                 .padding(.horizontal, 13)
                 .frame(height: 28)
             }
+
+            if case .activeEchoCancellation = node.nodeType {
+                HStack(spacing: 6) {
+                    Text("MIC")
+                    Spacer()
+                    Text("REFERENCE · TOP")
+                }
+                .font(.system(size: 8.5, weight: .bold))
+                .tracking(0.45)
+                .foregroundStyle(AppTheme.secondaryText)
+                .padding(.horizontal, 13)
+                .frame(height: 28)
+            }
         }
         .background(AppTheme.panelBackground)
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .stroke(
-                    isSelected ? accent : Color.white.opacity(0.10),
-                    lineWidth: isSelected ? 2 : 1
+                    isDeviceDisconnected
+                        ? DemoContent.orange
+                        : (isSelected
+                            ? accent
+                            : Color.white.opacity(0.10)),
+                    lineWidth:
+                        (isSelected || isDeviceDisconnected) ? 2 : 1
                 )
         }
         .opacity(node.isEnabled ? 1 : 0.56)

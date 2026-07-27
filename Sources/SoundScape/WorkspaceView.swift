@@ -32,6 +32,17 @@ struct WorkspaceView: View {
         )
     }
 
+    private var disconnectedDeviceNodeIDs: Set<String> {
+        Set(session.nodes.compactMap { node in
+            guard case .inputDevice = node.nodeType,
+                  let uid = node.deviceUID,
+                  audioDevices.device(withUID: uid) == nil else {
+                return nil
+            }
+            return node.id
+        })
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             workspaceToolbar
@@ -75,6 +86,8 @@ struct WorkspaceView: View {
                         session: $session,
                         selectedNodeID: $selectedNodeID,
                         selectedNodeIDs: $selectedNodeIDs,
+                        disconnectedDeviceNodeIDs:
+                            disconnectedDeviceNodeIDs,
                         pendingLibraryDrop: $pendingLibraryDrop,
                         activeLibraryDrag: $activeLibraryDrag,
                         removeNode: removeNode,
@@ -335,6 +348,11 @@ struct WorkspaceView: View {
                     )
                 ]
             }
+        } else if case .activeEchoCancellation = item.nodeType {
+            node.parameterValues = [
+                "aec.microphoneDelayMS": 0,
+                "aec.autoAlignment": 1
+            ]
         }
         session.nodes.append(node)
         selectedNodeID = nil
@@ -350,6 +368,8 @@ struct WorkspaceView: View {
             "Choose an application"
         case .systemAudioInput:
             "All system audio"
+        case .activeEchoCancellation:
+            "Microphone echo removal"
         case .outputDevice:
             "Default macOS output"
         case .recorder:
@@ -444,7 +464,12 @@ struct WorkspaceView: View {
                 && session.nodes[index].isEnabled != enabled
                 && {
                     switch session.nodes[index].nodeType {
-                    case .audioUnit, .vst3, .builtInEffect, .combine, .recorder:
+                    case .audioUnit,
+                         .vst3,
+                         .builtInEffect,
+                         .activeEchoCancellation,
+                         .combine,
+                         .recorder:
                         return true
                     case .inputDevice,
                          .applicationAudioInput,

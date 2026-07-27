@@ -1,0 +1,4 @@
+module WebRTCAECBridge {
+    header "WebRTCAECBridge.h"
+    export *
+}

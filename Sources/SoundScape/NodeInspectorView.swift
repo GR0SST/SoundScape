@@ -34,6 +34,8 @@ struct NodeInspectorView: View {
                         applicationAudioControls
                     case .systemAudioInput:
                         systemAudioControls
+                    case .activeEchoCancellation:
+                        activeEchoCancellationControls
                     case .outputDevice:
                         outputControls
                     case .recorder:
@@ -130,7 +132,9 @@ struct NodeInspectorView: View {
         let systemDefault = audioDevices.inputDevices.first {
             $0.isDefaultInput
         }
-        return (selected ?? systemDefault)?.inputChannels
+        return node.deviceUID == nil
+            ? systemDefault?.inputChannels
+            : selected?.inputChannels
     }
 
     private var applicationAudioControls: some View {
@@ -389,7 +393,12 @@ struct NodeInspectorView: View {
                         .frame(width: 18)
 
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(selected?.name ?? "System Default")
+                        Text(
+                            selected?.name
+                                ?? (node.deviceUID == nil
+                                    ? "System Default"
+                                    : node.subtitle)
+                        )
                             .font(.system(size: 11.5, weight: .semibold))
                             .foregroundStyle(.white)
                             .lineLimit(1)
@@ -430,7 +439,7 @@ struct NodeInspectorView: View {
         channelCount: Int?
     ) -> String {
         if node.deviceUID != nil, selected == nil {
-            return "Device is disconnected"
+            return "Disconnected · waiting for this device"
         }
         if let channelCount {
             return "\(channelCount) channel\(channelCount == 1 ? "" : "s")"
@@ -812,6 +821,193 @@ struct NodeInspectorView: View {
 
     private func combineSettings(_ key: String) -> CombineInputSettings {
         node.combineInputSettings[key] ?? CombineInputSettings()
+    }
+
+    private var activeEchoCancellationControls: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionTitle("ACTIVE ECHO CANCELLATION")
+
+            VStack(alignment: .leading, spacing: 11) {
+                aecInputRow(
+                    title: "Microphone",
+                    systemImage: "mic.fill",
+                    isReference: false
+                )
+                Divider().overlay(AppTheme.line)
+                aecInputRow(
+                    title: "Echo reference",
+                    systemImage: "desktopcomputer",
+                    isReference: true
+                )
+                Divider().overlay(AppTheme.line)
+                hostBypassControl
+            }
+            .cardStyle()
+
+            aecAlignmentCard
+
+            compactSlider(
+                title: aecAutoAlignmentEnabled
+                    ? "Manual fine adjustment"
+                    : "Microphone alignment",
+                value: aecParameterBinding(
+                    "aec.microphoneDelayMS",
+                    defaultValue: 0
+                ),
+                range: 0...500,
+                valueText: format(aecParameter(
+                    "aec.microphoneDelayMS",
+                    defaultValue: 0
+                ), digits: 0) + " ms"
+            )
+            .cardStyle()
+        }
+    }
+
+    private var aecAlignmentCard: some View {
+        let status = audioEngine.aecAlignmentByNodeID[node.id]
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Auto alignment")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(aecAlignmentSummary(status))
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(AppTheme.secondaryText)
+                }
+                Spacer()
+                Toggle("", isOn: aecAutoAlignmentBinding)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .tint(DemoContent.cyan)
+            }
+
+            if aecAutoAlignmentEnabled,
+               audioEngine.isRunning,
+               status?.hasReliableEstimate != true {
+                ProgressView(value: status?.progress ?? 0)
+                    .progressViewStyle(.linear)
+                    .tint(DemoContent.cyan)
+            }
+
+            if aecAutoAlignmentEnabled {
+                Button {
+                    audioEngine.recalibrateActiveEchoCancellation(
+                        nodeID: node.id
+                    )
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: "scope")
+                        Text("Calibrate Now")
+                    }
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 30)
+                    .background(Color.white.opacity(0.055))
+                    .clipShape(
+                        RoundedRectangle(
+                            cornerRadius: 6,
+                            style: .continuous
+                        )
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(!audioEngine.isRunning)
+                .opacity(audioEngine.isRunning ? 1 : 0.45)
+            }
+        }
+        .cardStyle()
+    }
+
+    private var aecAutoAlignmentEnabled: Bool {
+        aecParameter("aec.autoAlignment", defaultValue: 1) >= 0.5
+    }
+
+    private var aecAutoAlignmentBinding: Binding<Bool> {
+        Binding(
+            get: { aecAutoAlignmentEnabled },
+            set: { enabled in
+                node.parameterValues["aec.autoAlignment"] =
+                    enabled ? 1 : 0
+                audioEngine.updateActiveEchoCancellationNode(node)
+            }
+        )
+    }
+
+    private func aecAlignmentSummary(
+        _ status: AECAlignmentStatus?
+    ) -> String {
+        guard aecAutoAlignmentEnabled else {
+            return "Manual"
+        }
+        guard audioEngine.isRunning else {
+            return "Starts with flow"
+        }
+        guard let status, status.hasReliableEstimate else {
+            if status?.windowsAnalyzed ?? 0 >= 2 {
+                return "Echo not detected · use speakers"
+            }
+            return "Play system audio through speakers"
+        }
+
+        if status.microphoneDelayMS >= 0.5 {
+            return "Mic +\(format(status.microphoneDelayMS, digits: 0)) ms"
+        }
+        if status.referenceDelayMS >= 0.5 {
+            return "Reference +\(format(status.referenceDelayMS, digits: 0)) ms"
+        }
+        return "Aligned"
+    }
+
+    private func aecInputRow(
+        title: String,
+        systemImage: String,
+        isReference: Bool
+    ) -> some View {
+        let connection = graphConnections.first {
+            $0.to == node.id && $0.isReference == isReference
+        }
+        let sourceName = connection.flatMap { connection in
+            graphNodes.first { $0.id == connection.from }?.title
+        } ?? "Not connected"
+
+        return HStack(spacing: 9) {
+            Image(systemName: systemImage)
+                .frame(width: 15)
+                .foregroundStyle(
+                    connection == nil
+                        ? AppTheme.tertiaryText
+                        : DemoContent.cyan
+                )
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+            Spacer()
+            Text(sourceName)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(AppTheme.secondaryText)
+                .lineLimit(1)
+        }
+    }
+
+    private func aecParameter(
+        _ key: String,
+        defaultValue: Double
+    ) -> Double {
+        node.parameterValues[key] ?? defaultValue
+    }
+
+    private func aecParameterBinding(
+        _ key: String,
+        defaultValue: Double
+    ) -> Binding<Double> {
+        Binding(
+            get: { aecParameter(key, defaultValue: defaultValue) },
+            set: { value in
+                node.parameterValues[key] = value
+                audioEngine.updateActiveEchoCancellationNode(node)
+            }
+        )
     }
 
     private func updateCombineSettings(

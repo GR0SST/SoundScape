@@ -29,9 +29,25 @@ let package = Package(
                 .linkedFramework("Foundation")
             ]
         ),
+        .binaryTarget(
+            name: "WebRTCAECBridge",
+            path: "Vendor/WebRTCAECBridge.xcframework"
+        ),
+        .target(
+            name: "CAECProcessor",
+            dependencies: ["WebRTCAECBridge"],
+            path: "Sources/CAECProcessor",
+            sources: ["SoundScapeAEC.c"],
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedFramework("CoreAudio"),
+                .linkedFramework("CoreFoundation"),
+                .linkedLibrary("c++")
+            ]
+        ),
         .executableTarget(
             name: "SoundScape",
-            dependencies: ["CSQLite", "CVST3Host"],
+            dependencies: ["CSQLite", "CVST3Host", "CAECProcessor"],
             path: "Sources/SoundScape"
         )
     ],

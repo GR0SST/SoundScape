@@ -49,6 +49,8 @@ final class AudioEngineController: ObservableObject {
     @Published private(set) var recordingURLsByNodeID: [String: URL] = [:]
     @Published private(set) var recorderErrorsByNodeID: [String: String] = [:]
     @Published private(set) var recordedDurationByNodeID: [String: TimeInterval] = [:]
+    @Published private(set) var aecAlignmentByNodeID:
+        [String: AECAlignmentStatus] = [:]
 
     private var engine = AVAudioEngine()
     private var outputEngine = AVAudioEngine()
@@ -61,6 +63,9 @@ final class AudioEngineController: ObservableObject {
     private var processingEngineOutputActive = false
     private var hostedUnits: [String: AVAudioUnit] = [:]
     private var hostedVST3Plugins: [String: SSVST3Plugin] = [:]
+    private var hostedAECUnits: [String: AVAudioUnit] = [:]
+    private var hostedAECProcessors:
+        [String: ActiveEchoCancellationAudioUnit] = [:]
     private var hostedBuiltInNodes: [String: AVAudioNode] = [:]
     private var hostedCombineMixers: [String: AVAudioMixerNode] = [:]
     private var hostedCombineInputNodes: [String: AVAudioMixerNode] = [:]
@@ -83,7 +88,24 @@ final class AudioEngineController: ObservableObject {
     private var recoveryTask: Task<Void, Never>?
     private var startupTask: Task<Void, Error>?
     private var configurationObservers: [NSObjectProtocol] = []
+    private var hardwarePropertyListener: AudioObjectPropertyListenerBlock?
     private var startGeneration = UUID()
+
+    init() {
+        installHardwarePropertyListener()
+    }
+
+    deinit {
+        guard let hardwarePropertyListener else { return }
+        for var address in Self.observedHardwareAddresses {
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                .main,
+                hardwarePropertyListener
+            )
+        }
+    }
 
     func start(session: AudioSession) async {
         let fallbackSession = isRunning ? activeSession : nil
@@ -334,6 +356,86 @@ final class AudioEngineController: ObservableObject {
         scheduleRecovery(for: activeSession, delay: .milliseconds(350))
     }
 
+    private func installHardwarePropertyListener() {
+        let listener: AudioObjectPropertyListenerBlock = {
+            [weak self] count, addresses in
+            let selectors = (0..<Int(count)).map {
+                addresses[$0].mSelector
+            }
+            Task { @MainActor [weak self] in
+                self?.handleHardwarePropertyChanges(selectors)
+            }
+        }
+        var installed = false
+        for var address in Self.observedHardwareAddresses {
+            if AudioObjectAddPropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                .main,
+                listener
+            ) == noErr {
+                installed = true
+            }
+        }
+        if installed {
+            hardwarePropertyListener = listener
+        }
+    }
+
+    private func handleHardwarePropertyChanges(
+        _ selectors: [AudioObjectPropertySelector]
+    ) {
+        guard isFlowEnabled, !isLoading, let activeSession else { return }
+
+        let followsDefaultInput = activeSession.nodes.contains { node in
+            guard case .inputDevice = node.nodeType else { return false }
+            return node.deviceUID == nil
+        }
+        let followsDefaultOutput = activeSession.nodes.contains { node in
+            guard case .outputDevice = node.nodeType else { return false }
+            return node.deviceUID == nil
+        }
+        let selectedDeviceIsMissing = activeSession.nodes.contains { node in
+            switch node.nodeType {
+            case .inputDevice, .outputDevice:
+                guard let uid = node.deviceUID else { return false }
+                return AudioDeviceCatalog.audioObjectID(forUID: uid) == nil
+            default:
+                return false
+            }
+        }
+
+        let shouldReconnect = selectors.contains { selector in
+            switch selector {
+            case kAudioHardwarePropertyDefaultInputDevice:
+                followsDefaultInput
+            case kAudioHardwarePropertyDefaultOutputDevice:
+                followsDefaultOutput
+            case kAudioHardwarePropertyDevices:
+                !isRunning || selectedDeviceIsMissing
+            default:
+                false
+            }
+        }
+        guard shouldReconnect else { return }
+        handleUnexpectedConfigurationChange()
+    }
+
+    nonisolated private static var observedHardwareAddresses:
+        [AudioObjectPropertyAddress] {
+        [
+            kAudioHardwarePropertyDevices,
+            kAudioHardwarePropertyDefaultInputDevice,
+            kAudioHardwarePropertyDefaultOutputDevice
+        ].map { selector in
+            AudioObjectPropertyAddress(
+                mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+        }
+    }
+
     private func teardownEngine() {
         removeConfigurationObservers()
         meterTimer?.invalidate()
@@ -373,6 +475,10 @@ final class AudioEngineController: ObservableObject {
         engine.reset()
         outputEngine.reset()
         for audioUnit in hostedUnits.values
+        where engine.attachedNodes.contains(audioUnit) {
+            engine.detach(audioUnit)
+        }
+        for audioUnit in hostedAECUnits.values
         where engine.attachedNodes.contains(audioUnit) {
             engine.detach(audioUnit)
         }
@@ -626,6 +732,22 @@ final class AudioEngineController: ObservableObject {
                 band.bypass = !modelBand.isEnabled
             }
         }
+    }
+
+    func updateActiveEchoCancellationNode(_ node: AudioNode) {
+        guard case .activeEchoCancellation = node.nodeType,
+              let processor = hostedAECProcessors[node.id] else {
+            return
+        }
+        applyAECSettings(node, to: processor)
+    }
+
+    func recalibrateActiveEchoCancellation(nodeID: String) {
+        guard let processor = hostedAECProcessors[nodeID] else { return }
+        processor.requestAlignment()
+        aecAlignmentByNodeID[nodeID] = AECAlignmentStatus(
+            isEnabled: true
+        )
     }
 
     func capturedAudioUnitStates() -> [String: Data] {
@@ -919,6 +1041,26 @@ final class AudioEngineController: ObservableObject {
                 if node.isEnabled {
                     enabledUnits.append((node, audioUnit))
                 }
+            case .activeEchoCancellation:
+                statusMessage = "Loading Active Echo Cancellation…"
+                let audioUnit: AVAudioUnit
+                let processor: ActiveEchoCancellationAudioUnit
+                if let existingUnit = hostedAECUnits[node.id],
+                   let existingProcessor = hostedAECProcessors[node.id] {
+                    audioUnit = existingUnit
+                    processor = existingProcessor
+                } else {
+                    let hosted = try await instantiateAEC(node: node)
+                    audioUnit = hosted.audioUnit
+                    processor = hosted.processor
+                    try Task.checkCancellation()
+                }
+                applyAECSettings(node, to: processor)
+                hostedAECUnits[node.id] = audioUnit
+                hostedAECProcessors[node.id] = processor
+                if node.isEnabled {
+                    enabledUnits.append((node, audioUnit))
+                }
             case .recorder:
                 recorderErrorsByNodeID[node.id] = nil
                 continue
@@ -1021,6 +1163,19 @@ final class AudioEngineController: ObservableObject {
                     hostedBuiltInNodes[node.id] = bypass
                     engineNodes[node.id] = bypass
                 }
+            case .activeEchoCancellation:
+                if node.isEnabled {
+                    guard let audioUnit = hostedAECUnits[node.id] else {
+                        throw AudioGraphError.unsupportedNode(node.title)
+                    }
+                    engine.attach(audioUnit)
+                    engineNodes[node.id] = audioUnit
+                } else {
+                    let bypass = AVAudioMixerNode()
+                    engine.attach(bypass)
+                    hostedBuiltInNodes[node.id] = bypass
+                    engineNodes[node.id] = bypass
+                }
             case .recorder:
                 let recorder = attachRecorder(
                     node,
@@ -1089,6 +1244,18 @@ final class AudioEngineController: ObservableObject {
             _ = source
             connectionPointsBySource[connection.from, default: []].append(
                 AVAudioConnectionPoint(node: destination, bus: 0)
+            )
+        }
+        for connection in plan.referenceConnections {
+            guard let source = engineNodes[connection.from],
+                  let destination = hostedAECUnits[connection.to],
+                  plan.nodes.first(where: { $0.id == connection.to })?
+                    .isEnabled == true else {
+                continue
+            }
+            _ = source
+            connectionPointsBySource[connection.from, default: []].append(
+                AVAudioConnectionPoint(node: destination, bus: 1)
             )
         }
         for (sourceID, points) in connectionPointsBySource {
@@ -1784,6 +1951,10 @@ final class AudioEngineController: ObservableObject {
             throw AudioGraphError.invalidAudioUnitBusses(audioUnit.name)
         }
         try unit.inputBusses[0].setFormat(format)
+        if unit is ActiveEchoCancellationAudioUnit,
+           unit.inputBusses.count > 1 {
+            try unit.inputBusses[1].setFormat(format)
+        }
         try unit.outputBusses[0].setFormat(format)
     }
 
@@ -1900,6 +2071,10 @@ final class AudioEngineController: ObservableObject {
                         self.activeRecorderNodeIDs.remove(nodeID)
                     }
                 }
+                for (nodeID, processor) in self.hostedAECProcessors {
+                    self.aecAlignmentByNodeID[nodeID] =
+                        processor.alignmentStatus()
+                }
                 if self.isFlowEnabled,
                    self.isRunning,
                    (!self.engine.isRunning
@@ -1955,6 +2130,37 @@ final class AudioEngineController: ObservableObject {
         }
         wrapper.configure(plugin: plugin)
         return (audioUnit, plugin)
+    }
+
+    private func instantiateAEC(
+        node: AudioNode
+    ) async throws -> (
+        audioUnit: AVAudioUnit,
+        processor: ActiveEchoCancellationAudioUnit
+    ) {
+        ActiveEchoCancellationAudioUnit.registerIfNeeded()
+        let audioUnit = try await AVAudioUnit.instantiate(
+            with: ActiveEchoCancellationAudioUnit.componentDescription,
+            options: [.loadInProcess]
+        )
+        guard let processor =
+            audioUnit.auAudioUnit as? ActiveEchoCancellationAudioUnit else {
+            throw ActiveEchoCancellationError.instantiationFailed
+        }
+        applyAECSettings(node, to: processor)
+        return (audioUnit, processor)
+    }
+
+    private func applyAECSettings(
+        _ node: AudioNode,
+        to processor: ActiveEchoCancellationAudioUnit
+    ) {
+        processor.updateSettings(
+            microphoneDelayMS:
+                node.parameterValues["aec.microphoneDelayMS"] ?? 0,
+            autoAlignmentEnabled:
+                (node.parameterValues["aec.autoAlignment"] ?? 1) >= 0.5
+        )
     }
 
     private func applyNodeSettings(
@@ -2082,7 +2288,6 @@ final class AudioEngineController: ObservableObject {
             }
         })
         let removedNodeIDs = Set(hostedUnits.keys).subtracting(validNodeIDs)
-        guard !removedNodeIDs.isEmpty else { return }
 
         for nodeID in removedNodeIDs {
             hostedUnits[nodeID] = nil
@@ -2093,6 +2298,20 @@ final class AudioEngineController: ObservableObject {
             customViewsByNodeID[nodeID] = nil
             customViewErrorsByNodeID[nodeID] = nil
             loadingCustomViewNodeIDs.remove(nodeID)
+        }
+
+        let validAECNodeIDs = Set(session.nodes.compactMap { node -> String? in
+            guard case .activeEchoCancellation = node.nodeType else {
+                return nil
+            }
+            return node.id
+        })
+        let removedAECNodeIDs =
+            Set(hostedAECUnits.keys).subtracting(validAECNodeIDs)
+        for nodeID in removedAECNodeIDs {
+            hostedAECUnits[nodeID] = nil
+            hostedAECProcessors[nodeID] = nil
+            aecAlignmentByNodeID[nodeID] = nil
         }
     }
 
@@ -2239,6 +2458,27 @@ final class AudioEngineController: ObservableObject {
         let activeConnections = audioConnections.filter {
             activeIDs.contains($0.from) && activeIDs.contains($0.to)
         }
+        let referenceConnections = session.connections.filter { connection in
+            guard connection.isReference,
+                  activeIDs.contains(connection.to),
+                  let source = nodesByID[connection.from],
+                  let target = nodesByID[connection.to] else {
+                return false
+            }
+            let sourceIsInput: Bool
+            switch source.nodeType {
+            case .inputDevice,
+                 .applicationAudioInput,
+                 .systemAudioInput:
+                sourceIsInput = true
+            default:
+                sourceIsInput = false
+            }
+            guard case .activeEchoCancellation = target.nodeType else {
+                return false
+            }
+            return sourceIsInput
+        }
         for nodeID in activeIDs {
             guard let node = nodesByID[nodeID] else {
                 throw AudioGraphError.invalidConnection
@@ -2298,11 +2538,16 @@ final class AudioEngineController: ObservableObject {
         }
 
         let orderedNodes = orderedIDs.compactMap { nodesByID[$0] }
+        let referenceSourceIDs = Set(referenceConnections.map(\.from))
         return AudioGraphPlan(
-            inputs: inputs.filter { activeIDs.contains($0.id) },
+            inputs: inputs.filter {
+                activeIDs.contains($0.id)
+                    || referenceSourceIDs.contains($0.id)
+            },
             outputs: reachableOutputs,
             nodes: orderedNodes,
-            connections: activeConnections
+            connections: activeConnections,
+            referenceConnections: referenceConnections
         )
     }
 
@@ -2313,6 +2558,7 @@ private struct AudioGraphPlan {
     let outputs: [AudioNode]
     let nodes: [AudioNode]
     let connections: [GraphConnection]
+    let referenceConnections: [GraphConnection]
 }
 
 private struct RecorderSnapshot {
@@ -2426,7 +2672,7 @@ private enum AudioGraphError: LocalizedError {
         case .unsupportedNode(let name):
             "\(name) is not a supported processing node."
         case .deviceUnavailable(let name):
-            "\(name) is not currently connected. Choose another device."
+            "\(name) is disconnected. Waiting for the same device to reconnect."
         case .deviceSelection(let role, let name, let detail):
             "Could not use \(role) device \(name): \(detail)"
         case .routeVerificationFailed:

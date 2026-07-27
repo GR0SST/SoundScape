@@ -216,6 +216,7 @@ enum AudioNodeType: Codable, Hashable {
     case inputDevice
     case applicationAudioInput
     case systemAudioInput
+    case activeEchoCancellation
     case outputDevice
     case recorder
     case combine
@@ -228,6 +229,7 @@ enum AudioNodeType: Codable, Hashable {
         case .inputDevice: "input-device"
         case .applicationAudioInput: "application-audio-input"
         case .systemAudioInput: "system-audio-input"
+        case .activeEchoCancellation: "active-echo-cancellation"
         case .outputDevice: "output-device"
         case .recorder: "recorder"
         case .combine: "combine"
@@ -362,6 +364,7 @@ struct AudioSession: Identifiable {
 
     var processingFingerprint: String {
         let audioConnections = connections.filter { !$0.isReference }
+        let referenceConnections = connections.filter(\.isReference)
         let inputIDs = Set(nodes.compactMap { node -> String? in
             switch node.nodeType {
             case .inputDevice, .applicationAudioInput, .systemAudioInput:
@@ -403,7 +406,11 @@ struct AudioSession: Identifiable {
             }
         }
 
-        let activeNodeIDs = reachableFromInput.intersection(canReachOutput)
+        var activeNodeIDs = reachableFromInput.intersection(canReachOutput)
+        let activeReferenceConnections = referenceConnections.filter {
+            activeNodeIDs.contains($0.to)
+        }
+        activeNodeIDs.formUnion(activeReferenceConnections.map(\.from))
         let nodePart = nodes
             .filter { activeNodeIDs.contains($0.id) }
             .map {
@@ -417,12 +424,14 @@ struct AudioSession: Identifiable {
             }
             .sorted()
             .joined(separator: "|")
-        let connectionPart = audioConnections
+        let connectionPart = (audioConnections + activeReferenceConnections)
             .filter {
                 activeNodeIDs.contains($0.from)
                     && activeNodeIDs.contains($0.to)
             }
-            .map { "\($0.id.uuidString):\($0.from)>\($0.to)" }
+            .map {
+                "\($0.id.uuidString):\($0.from)>\($0.to):\($0.isReference)"
+            }
             .sorted()
             .joined(separator: "|")
         return "\(nodePart)#\(connectionPart)"
@@ -468,14 +477,7 @@ final class SessionStore: ObservableObject {
         didSet { scheduleSave() }
     }
 
-    @Published var activeSessionID: UUID? {
-        didSet {
-            persistence.setSetting(
-                activeSessionID?.uuidString,
-                forKey: "last_active_project"
-            )
-        }
-    }
+    @Published var activeSessionID: UUID?
 
     private let persistence: SQLiteProjectStore
     private var pendingSave: Task<Void, Never>?
@@ -483,15 +485,11 @@ final class SessionStore: ObservableObject {
     init(persistence: SQLiteProjectStore = .shared) {
         self.persistence = persistence
         let loadedSessions = persistence.loadSessions()
-        self.sessions = loadedSessions.isEmpty ? DemoContent.sessions : loadedSessions
-
-        if let storedID = persistence.stringSetting(forKey: "last_active_project"),
-           let id = UUID(uuidString: storedID),
-           self.sessions.contains(where: { $0.id == id }) {
-            self.activeSessionID = id
-        } else {
-            self.activeSessionID = nil
-        }
+        self.sessions = loadedSessions.isEmpty
+            ? DemoContent.sessions
+            : loadedSessions
+        self.activeSessionID = nil
+        persistence.setSetting(nil, forKey: "last_active_project")
 
         // Persist decoded migrations immediately instead of waiting for the
         // user to edit the graph.
@@ -657,6 +655,13 @@ enum DemoContent {
                 icon: "arrow.triangle.merge",
                 kind: .combine,
                 nodeType: .combine
+            ),
+            LibraryItem(
+                id: "active-echo-cancellation",
+                title: "Active Echo Cancellation",
+                icon: "waveform.badge.minus",
+                kind: .effect,
+                nodeType: .activeEchoCancellation
             )
         ] + BuiltInEffectType.allCases.map { effect in
             LibraryItem(

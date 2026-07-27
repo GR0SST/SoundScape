@@ -17,6 +17,7 @@ struct CoreAudioDevice: Identifiable, Hashable {
 final class AudioDeviceCatalog: ObservableObject {
     @Published private(set) var devices: [CoreAudioDevice] = []
     @Published private(set) var errorMessage: String?
+    private var hardwarePropertyListener: AudioObjectPropertyListenerBlock?
 
     var inputDevices: [CoreAudioDevice] {
         devices.filter { $0.inputChannels > 0 }
@@ -28,6 +29,19 @@ final class AudioDeviceCatalog: ObservableObject {
 
     init() {
         refresh()
+        installDeviceListListener()
+    }
+
+    deinit {
+        guard let hardwarePropertyListener else { return }
+        for var address in Self.observedHardwareAddresses {
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                .main,
+                hardwarePropertyListener
+            )
+        }
     }
 
     func refresh() {
@@ -85,6 +99,44 @@ final class AudioDeviceCatalog: ObservableObject {
     func device(withUID uid: String?) -> CoreAudioDevice? {
         guard let uid else { return nil }
         return devices.first { $0.uid == uid }
+    }
+
+    private func installDeviceListListener() {
+        let listener: AudioObjectPropertyListenerBlock = {
+            [weak self] _, _ in
+            Task { @MainActor [weak self] in
+                self?.refresh()
+            }
+        }
+        var installed = false
+        for var address in Self.observedHardwareAddresses {
+            if AudioObjectAddPropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                .main,
+                listener
+            ) == noErr {
+                installed = true
+            }
+        }
+        if installed {
+            hardwarePropertyListener = listener
+        }
+    }
+
+    nonisolated private static var observedHardwareAddresses:
+        [AudioObjectPropertyAddress] {
+        [
+            kAudioHardwarePropertyDevices,
+            kAudioHardwarePropertyDefaultInputDevice,
+            kAudioHardwarePropertyDefaultOutputDevice
+        ].map { selector in
+            AudioObjectPropertyAddress(
+                mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+        }
     }
 
     static func audioObjectID(forUID uid: String) -> AudioObjectID? {

@@ -1,0 +1,4 @@
+module CAECProcessor {
+    header "SoundScapeAEC.h"
+    export *
+}
