@@ -13,6 +13,7 @@
   <img alt="Swift 6" src="https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white">
   <img alt="Audio Units" src="https://img.shields.io/badge/plug--ins-Audio%20Units-28C7E7">
   <img alt="VST3" src="https://img.shields.io/badge/plug--ins-VST3-28C7E7">
+  <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-28C7E7">
 </p>
 
 ![SoundScape node graph](Resources/Screenshots/soundscape-node-graph.png)
@@ -133,5 +134,11 @@ open dist/SoundScape.dmg
 
 SoundScape is under active development. Bug reports, compatibility notes, and
 focused pull requests are welcome.
+
+## License
+
+SoundScape's original source code is available under the
+[MIT License](LICENSE). Bundled third-party components remain under their
+respective licenses listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 VST is a registered trademark of Steinberg Media Technologies GmbH.
