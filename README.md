@@ -16,6 +16,12 @@
   <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-28C7E7">
 </p>
 
+<p align="center">
+  <a href="https://ko-fi.com/J6A2240H5R">
+    <img alt="Support SoundScape on Ko-fi" src="https://ko-fi.com/img/githubbutton_sm.svg">
+  </a>
+</p>
+
 ![SoundScape node graph](Resources/Screenshots/soundscape-node-graph.png)
 
 SoundScape is a node-based audio workstation for routing audio between
