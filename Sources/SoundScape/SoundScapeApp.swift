@@ -54,8 +54,6 @@ struct SoundScapeApp: App {
         }
 
         MenuBarExtra(
-            "SoundScape",
-            systemImage: "waveform",
             isInserted: Binding(
                 get: { settings.showMenuBarIcon },
                 set: { isVisible in
@@ -67,6 +65,8 @@ struct SoundScapeApp: App {
             MenuBarContentView()
                 .environmentObject(store)
                 .environmentObject(audioEnginePool)
+        } label: {
+            MenuBarAudioIcon(meter: audioEnginePool.menuBarMeter)
         }
         .menuBarExtraStyle(.menu)
     }

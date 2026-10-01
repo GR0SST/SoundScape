@@ -1,8 +1,12 @@
+import Combine
 import Foundation
 
 @MainActor
 final class AudioEnginePool: ObservableObject {
+    let menuBarMeter = MenuBarAudioMeter()
     private var enginesBySessionID: [UUID: AudioEngineController] = [:]
+    private var meterSubscriptions: [UUID: AnyCancellable] = [:]
+    private var outputLevels: [UUID: Double] = [:]
 
     func engine(for sessionID: UUID) -> AudioEngineController {
         if let existing = enginesBySessionID[sessionID] {
@@ -11,11 +15,22 @@ final class AudioEnginePool: ObservableObject {
 
         let engine = AudioEngineController()
         enginesBySessionID[sessionID] = engine
+        meterSubscriptions[sessionID] = engine.$outputLevelDB
+            .combineLatest(engine.$isRunning)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] level, running in
+                guard let self else { return }
+                self.outputLevels[sessionID] = running ? level : -96
+                self.menuBarMeter.setLevel(self.outputLevels.values.max() ?? -96)
+            }
         return engine
     }
 
     func stopAndRemoveEngine(for sessionID: UUID) {
+        meterSubscriptions.removeValue(forKey: sessionID)?.cancel()
+        outputLevels.removeValue(forKey: sessionID)
         enginesBySessionID.removeValue(forKey: sessionID)?.stop()
+        menuBarMeter.setLevel(outputLevels.values.max() ?? -96)
     }
 
     func toggleFlow(

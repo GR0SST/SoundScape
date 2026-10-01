@@ -1,3 +1,4 @@
+import AppKit
 import AVFAudio
 import Combine
 import CoreGraphics
@@ -23,6 +24,24 @@ final class SystemAudioApplicationCatalog: ObservableObject {
         guard !isLoading else { return }
         isLoading = true
         errorMessage = nil
+
+        if #available(macOS 14.2, *) {
+            // Enumerating running applications needs no screen-recording permission.
+            var seen = Set<String>()
+            applications = NSWorkspace.shared.runningApplications.compactMap { app in
+                guard let identifier = app.bundleIdentifier,
+                      identifier != Bundle.main.bundleIdentifier,
+                      app.activationPolicy != .prohibited,
+                      seen.insert(identifier).inserted else { return nil }
+                return CapturableAudioApplication(
+                    bundleIdentifier: identifier,
+                    name: app.localizedName ?? identifier,
+                    processID: app.processIdentifier
+                )
+            }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            isLoading = false
+            return
+        }
 
         Task {
             do {
@@ -93,9 +112,12 @@ final class ScreenAudioCaptureSource: NSObject,
         AVAudioFrameCount
     ) -> Void
     private var stream: SCStream?
+    private var audioTap: ProcessAudioTap?
+    private let failureHandler: @Sendable () -> Void
 
     init(
         format: AVAudioFormat,
+        failureHandler: @escaping @Sendable () -> Void = {},
         inputBufferHandler: @escaping (
             UnsafePointer<AudioBufferList>,
             AVAudioFrameCount
@@ -104,6 +126,7 @@ final class ScreenAudioCaptureSource: NSObject,
         let bridge = AudioRingBuffer(
             channelCount: Int(format.channelCount)
         )
+        self.failureHandler = failureHandler
         self.bridge = bridge
         self.inputBufferHandler = inputBufferHandler
         sourceNode = AVAudioSourceNode(
@@ -121,6 +144,32 @@ final class ScreenAudioCaptureSource: NSObject,
 
     func start(for node: AudioNode, format: AVAudioFormat) async throws {
         try Task.checkCancellation()
+        if #available(macOS 14.2, *) {
+            let bundleIdentifier: String?
+            switch node.nodeType {
+            case .applicationAudioInput:
+                guard let identifier = node.applicationBundleIdentifier else {
+                    throw SystemAudioCaptureError.applicationUnavailable(node.subtitle)
+                }
+                bundleIdentifier = identifier
+            case .systemAudioInput:
+                bundleIdentifier = nil
+            default:
+                throw SystemAudioCaptureError.unsupportedSource
+            }
+            let tap = ProcessAudioTap()
+            try tap.start(
+                bundleIdentifier: bundleIdentifier,
+                excludesCurrentProcess: node.excludesCurrentProcessAudio,
+                format: format,
+                failureHandler: failureHandler
+            ) { [bridge, inputBufferHandler] data, frames in
+                bridge.write(data, frameCount: frames)
+                inputBufferHandler(data, frames)
+            }
+            audioTap = tap
+            return
+        }
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.excludingDesktopWindows(
@@ -213,11 +262,17 @@ final class ScreenAudioCaptureSource: NSObject,
     }
 
     func stop() {
+        audioTap?.stop()
+        audioTap = nil
         guard let stream else { return }
         self.stream = nil
         Task {
             try? await stream.stopCapture()
         }
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        failureHandler()
     }
 
     func stream(
@@ -260,8 +315,10 @@ enum SystemAudioCaptureError: LocalizedError {
 
     var shouldRetry: Bool {
         switch self {
+        case .noDisplay:
+            // ScreenCaptureKit may not see the display immediately after wake.
+            true
         case .permissionDenied,
-             .noDisplay,
              .applicationUnavailable,
              .unsupportedSource:
             false

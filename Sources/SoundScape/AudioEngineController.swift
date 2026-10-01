@@ -90,12 +90,31 @@ final class AudioEngineController: ObservableObject {
     private var configurationObservers: [NSObjectProtocol] = []
     private var hardwarePropertyListener: AudioObjectPropertyListenerBlock?
     private var startGeneration = UUID()
+    private var routeGeneration = UUID()
+    private var pendingRouteChange = false
+    private var wakeObserver: NSObjectProtocol?
+    private var inputWatchdogs: [AudioCallbackWatchdog] = []
 
     init() {
         installHardwarePropertyListener()
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleUnexpectedConfigurationChange()
+            }
+        }
     }
 
     deinit {
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+        }
+        for observer in configurationObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
         guard let hardwarePropertyListener else { return }
         for var address in Self.observedHardwareAddresses {
             AudioObjectRemovePropertyListenerBlock(
@@ -158,10 +177,7 @@ final class AudioEngineController: ObservableObject {
                 session: session,
                 generation: generation
             )
-            guard isFlowEnabled, generation == startGeneration else {
-                teardownEngine()
-                return
-            }
+            guard isFlowEnabled, generation == startGeneration else { return }
             finishSuccessfulStart()
         } catch {
             guard isFlowEnabled, generation == startGeneration else { return }
@@ -195,14 +211,14 @@ final class AudioEngineController: ObservableObject {
                 session: session,
                 generation: generation
             )
-            guard isFlowEnabled, generation == startGeneration else {
-                teardownEngine()
-                return
-            }
+            guard isFlowEnabled, generation == startGeneration else { return }
             finishSuccessfulStart()
-            errorMessage = graphErrorMessage
-            statusMessage = "Audio is flowing"
+            if isRunning {
+                errorMessage = graphErrorMessage
+                statusMessage = "Audio is flowing"
+            }
         } catch {
+            guard isFlowEnabled, generation == startGeneration else { return }
             finishFailedStart(error, session: session)
         }
     }
@@ -285,6 +301,7 @@ final class AudioEngineController: ObservableObject {
         }
         try Task.checkCancellation()
         installConfigurationObservers()
+        for watchdog in inputWatchdogs { watchdog.arm() }
         startMeterUpdates()
     }
 
@@ -296,6 +313,10 @@ final class AudioEngineController: ObservableObject {
         isLoading = false
         errorMessage = nil
         statusMessage = warningMessage ?? "Audio is flowing"
+        if pendingRouteChange {
+            pendingRouteChange = false
+            handleUnexpectedConfigurationChange()
+        }
     }
 
     private func finishFailedStart(
@@ -349,7 +370,13 @@ final class AudioEngineController: ObservableObject {
     }
 
     private func handleUnexpectedConfigurationChange() {
-        guard isFlowEnabled, !isLoading, let activeSession else { return }
+        guard isFlowEnabled, let activeSession else { return }
+        // Device changes can arrive while plug-ins or screen capture are awaiting
+        // initialization. Rebuild once that attempt finishes instead of losing them.
+        if isLoading {
+            pendingRouteChange = true
+            return
+        }
         isRunning = false
         errorMessage = "The audio route changed. Reconnecting automatically…"
         statusMessage = "Reconnecting…"
@@ -385,7 +412,7 @@ final class AudioEngineController: ObservableObject {
     private func handleHardwarePropertyChanges(
         _ selectors: [AudioObjectPropertySelector]
     ) {
-        guard isFlowEnabled, !isLoading, let activeSession else { return }
+        guard isFlowEnabled, let activeSession else { return }
 
         let followsDefaultInput = activeSession.nodes.contains { node in
             guard case .inputDevice = node.nodeType else { return false }
@@ -412,7 +439,9 @@ final class AudioEngineController: ObservableObject {
             case kAudioHardwarePropertyDefaultOutputDevice:
                 followsDefaultOutput
             case kAudioHardwarePropertyDevices:
-                !isRunning || selectedDeviceIsMissing
+                // Private capture aggregates also change this list during setup.
+                // Do not let our own device creation trigger a rebuild loop.
+                (!isRunning && !isLoading) || selectedDeviceIsMissing
             default:
                 false
             }
@@ -437,6 +466,9 @@ final class AudioEngineController: ObservableObject {
     }
 
     private func teardownEngine() {
+        routeGeneration = UUID()
+        pendingRouteChange = false
+        inputWatchdogs.removeAll()
         removeConfigurationObservers()
         meterTimer?.invalidate()
         meterTimer = nil
@@ -552,6 +584,7 @@ final class AudioEngineController: ObservableObject {
                 + additionalInputEngines
                 + additionalOutputEngines
             : [engine] + additionalInputEngines + additionalOutputEngines
+        let generation = routeGeneration
         for observedEngine in observedEngines {
             let observer = NotificationCenter.default.addObserver(
                 forName: .AVAudioEngineConfigurationChange,
@@ -559,7 +592,8 @@ final class AudioEngineController: ObservableObject {
                 queue: .main
             ) { [weak self] _ in
                 Task { @MainActor [weak self] in
-                    self?.handleUnexpectedConfigurationChange()
+                    guard let self, self.routeGeneration == generation else { return }
+                    self.handleUnexpectedConfigurationChange()
                 }
             }
             configurationObservers.append(observer)
@@ -574,7 +608,7 @@ final class AudioEngineController: ObservableObject {
     }
 
     private func friendlyError(_ error: Error) -> String {
-        if !CGPreflightScreenCaptureAccess(),
+        if #unavailable(macOS 14.2), !CGPreflightScreenCaptureAccess(),
            activeSession?.nodes.contains(where: {
                switch $0.nodeType {
                case .applicationAudioInput, .systemAudioInput:
@@ -1122,8 +1156,15 @@ final class AudioEngineController: ObservableObject {
 
         for input in screenInputModels {
             statusMessage = "Connecting \(input.title)…"
+            let generation = routeGeneration
             let capture = ScreenAudioCaptureSource(
-                format: processingFormat
+                format: processingFormat,
+                failureHandler: { [weak self] in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.routeGeneration == generation else { return }
+                        self.handleUnexpectedConfigurationChange()
+                    }
+                }
             ) { [levelProbe] inputData, frameCount in
                 levelProbe.updateInput(
                     inputData,
@@ -1548,7 +1589,10 @@ final class AudioEngineController: ObservableObject {
             channelCount: Int(format.channelCount)
         )
         let adapter = AVAudioMixerNode()
+        let watchdog = AudioCallbackWatchdog()
+        inputWatchdogs.append(watchdog)
         let sink = AVAudioSinkNode { _, frameCount, inputData in
+            if frameCount > 0 { watchdog.recordCallback() }
             bridge.write(inputData, frameCount: frameCount)
             return noErr
         }
@@ -2015,11 +2059,14 @@ final class AudioEngineController: ObservableObject {
     private func installSignalTaps() {
         let probe = levelProbe
         if hardwareInputActive {
+            let watchdog = AudioCallbackWatchdog()
+            inputWatchdogs.append(watchdog)
             engine.inputNode.installTap(
                 onBus: 0,
                 bufferSize: 1024,
                 format: nil
             ) { buffer, _ in
+                if buffer.frameLength > 0 { watchdog.recordCallback() }
                 probe.updateInput(buffer)
             }
             hasInputTap = true
@@ -2077,7 +2124,8 @@ final class AudioEngineController: ObservableObject {
                 }
                 if self.isFlowEnabled,
                    self.isRunning,
-                   (!self.engine.isRunning
+                   (self.inputWatchdogs.contains { $0.isStalled() }
+                    || !self.engine.isRunning
                     || (self.outputEngineActive
                         && !self.outputEngine.isRunning)
                     || self.additionalInputEngines.contains {

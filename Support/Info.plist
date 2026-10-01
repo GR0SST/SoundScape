@@ -17,15 +17,17 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1</string>
+    <string>0.2</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>3</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>SoundScape needs microphone access to run Input Device nodes through your Audio Unit processing chain.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>SoundScape captures audio from the system and selected applications to process it in your flow. No screen content is captured.</string>
     <key>NSScreenCaptureUsageDescription</key>
     <string>SoundScape needs Screen &amp; System Audio Recording access to route audio from applications and the system through your flow.</string>
 </dict>

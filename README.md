@@ -34,13 +34,19 @@ background or control it from the menu bar.
 | | |
 | --- | --- |
 | **Visual audio routing** | Connect, branch, combine, move, copy, and edit nodes on an infinite canvas. |
-| **Application and system capture** | Capture one application or all audio playing on macOS with ScreenCaptureKit. |
+| **Application and system capture** | Capture one application or all system audio with audio-only Core Audio taps on macOS 14.2+. |
 | **AU and VST3 hosting** | Discover installed effects, edit their parameters, embed native plug-in interfaces, and preserve plug-in state. |
 | **Realtime echo cancellation** | WebRTC AEC3 removes system playback captured by the microphone with automatic delay and clock alignment. |
 | **Native processing** | EQ, filters, compression, gain, balance, pan, mono/stereo conversion, and multi-input combining. |
 | **Recording and routing** | Record WAV or CAF files, route to multiple outputs, and select concrete Core Audio devices. |
 | **Persistent flows** | Projects, node layouts, settings, and plug-in state are stored locally in SQLite. |
 | **Background operation** | Flows continue when the dashboard is closed and remain available from the menu bar. |
+
+## What’s new in 0.2
+
+- Automatic audio recovery after Mac wake, route changes, and stalled microphone callbacks.
+- Audio-only system and application capture on macOS 14.2+, without starting a screen-sharing session.
+- A menu-bar waveform that responds to output volume and settles when audio is quiet.
 
 ## Plug-in support
 
@@ -88,7 +94,8 @@ SoundScape requires:
 
 - macOS 14 or newer
 - Microphone access for Input Device nodes
-- Screen & System Audio Recording access for application or system capture
+- System Audio Recording access for application or system capture on macOS 14.2+
+- Screen & System Audio Recording access on macOS 14.0–14.1, which use the older capture backend
 
 Development builds are ad-hoc signed. macOS can request permissions again when
 the executable is rebuilt because its code signature changes.

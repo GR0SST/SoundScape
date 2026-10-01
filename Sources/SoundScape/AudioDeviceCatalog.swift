@@ -65,6 +65,9 @@ final class AudioDeviceCatalog: ObservableObject {
                 continue
             }
 
+            // Internal process-tap devices are implementation details, not routes.
+            guard !uid.hasPrefix("dev.soundscape.capture.") else { continue }
+
             let inputChannels = Self.channelCount(
                 deviceID,
                 scope: kAudioObjectPropertyScopeInput
