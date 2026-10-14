@@ -124,7 +124,8 @@ final class ScreenAudioCaptureSource: NSObject,
         ) -> Void
     ) {
         let bridge = AudioRingBuffer(
-            channelCount: Int(format.channelCount)
+            channelCount: Int(format.channelCount),
+            maximumLatencyFrames: Int(format.sampleRate * 0.2)
         )
         self.failureHandler = failureHandler
         self.bridge = bridge

@@ -1,3 +1,4 @@
+import AVFAudio
 import CoreAudio
 import Foundation
 
@@ -228,6 +229,39 @@ final class AudioDeviceCatalog: ObservableObject {
         }
         guard status == noErr, let value else { return nil }
         return value as String
+    }
+
+    /// The device's current hardware rate and channel count in `scope`.
+    static func nominalFormat(
+        _ deviceID: AudioObjectID,
+        scope: AudioObjectPropertyScope
+    ) -> AVAudioFormat? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var sampleRate: Float64 = 0
+        var byteCount = UInt32(MemoryLayout<Float64>.size)
+        let channels = channelCount(deviceID, scope: scope)
+        guard AudioObjectGetPropertyData(
+            deviceID,
+            &address,
+            0,
+            nil,
+            &byteCount,
+            &sampleRate
+        ) == noErr,
+        sampleRate > 0,
+        channels > 0 else {
+            return nil
+        }
+        return AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: sampleRate,
+            channels: AVAudioChannelCount(channels),
+            interleaved: false
+        )
     }
 
     static func channelCount(

@@ -52,15 +52,16 @@ final class AudioEngineController: ObservableObject {
     @Published private(set) var aecAlignmentByNodeID:
         [String: AECAlignmentStatus] = [:]
 
+    // Runs in manual rendering mode. Hardware I/O goes through raw AUHALs, never through
+    // AVAudioEngine's own I/O nodes, because those follow the macOS default device.
     private var engine = AVAudioEngine()
-    private var outputEngine = AVAudioEngine()
-    private var additionalInputEngines: [AVAudioEngine] = []
+    private var halInputUnits: [HALAudioUnit] = []
+    private var halOutputUnits: [HALAudioUnit] = []
+    private var renderPump: ManualRenderPump?
+    private var renderTerminals: [RenderTerminal] = []
     private var additionalInputSourceNodes: [AVAudioSourceNode] = []
     private var screenAudioCaptureSources: [ScreenAudioCaptureSource] = []
-    private var additionalOutputEngines: [AVAudioEngine] = []
     private var hostedOutputMixers: [String: AVAudioMixerNode] = [:]
-    private var outputEngineActive = false
-    private var processingEngineOutputActive = false
     private var hostedUnits: [String: AVAudioUnit] = [:]
     private var hostedVST3Plugins: [String: SSVST3Plugin] = [:]
     private var hostedAECUnits: [String: AVAudioUnit] = [:]
@@ -70,24 +71,15 @@ final class AudioEngineController: ObservableObject {
     private var hostedCombineMixers: [String: AVAudioMixerNode] = [:]
     private var hostedCombineInputNodes: [String: AVAudioMixerNode] = [:]
     private var audioUnitGeneration = UUID()
-    private var bridgeBuffer: AudioRingBuffer?
-    private var inputAdapterNode: AVAudioMixerNode?
-    private var sinkNode: AVAudioSinkNode?
-    private var auxiliarySinkNode: AVAudioSinkNode?
     private var auxiliaryMixerNode: AVAudioMixerNode?
-    private var sourceNode: AVAudioSourceNode?
     private var recorderNodesByNodeID: [String: AVAudioMixerNode] = [:]
     private var recorderWritersByNodeID: [String: RecorderWriter] = [:]
     private var recorderTapNodeIDs: Set<String> = []
     private let levelProbe = AudioLevelProbe()
     private var meterTimer: Timer?
-    private var hasInputTap = false
-    private var hasOutputTap = false
-    private var hardwareInputActive = false
     private var activeSession: AudioSession?
     private var recoveryTask: Task<Void, Never>?
     private var startupTask: Task<Void, Error>?
-    private var configurationObservers: [NSObjectProtocol] = []
     private var hardwarePropertyListener: AudioObjectPropertyListenerBlock?
     private var startGeneration = UUID()
     private var routeGeneration = UUID()
@@ -111,9 +103,6 @@ final class AudioEngineController: ObservableObject {
     deinit {
         if let wakeObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
-        }
-        for observer in configurationObservers {
-            NotificationCenter.default.removeObserver(observer)
         }
         guard let hardwarePropertyListener else { return }
         for var address in Self.observedHardwareAddresses {
@@ -270,37 +259,14 @@ final class AudioEngineController: ObservableObject {
 
         statusMessage = "Starting audio devices…"
         engine.prepare()
-
-        for inputEngine in additionalInputEngines {
-            try Task.checkCancellation()
-            inputEngine.prepare()
-        }
-        for outputEngine in additionalOutputEngines {
-            try Task.checkCancellation()
-            outputEngine.prepare()
-        }
-        if outputEngineActive {
-            try Task.checkCancellation()
-            outputEngine.prepare()
-        }
-
-        try Task.checkCancellation()
-        for inputEngine in additionalInputEngines {
-            try Task.checkCancellation()
-            try inputEngine.start()
-        }
-        try Task.checkCancellation()
         try engine.start()
-        if outputEngineActive {
+        renderPump?.activate()
+        // Outputs first, so the first captured frames already have somewhere to go.
+        for unit in halOutputUnits + halInputUnits {
             try Task.checkCancellation()
-            try outputEngine.start()
-        }
-        for outputEngine in additionalOutputEngines {
-            try Task.checkCancellation()
-            try outputEngine.start()
+            try unit.start()
         }
         try Task.checkCancellation()
-        installConfigurationObservers()
         for watchdog in inputWatchdogs { watchdog.arm() }
         startMeterUpdates()
     }
@@ -380,7 +346,8 @@ final class AudioEngineController: ObservableObject {
         isRunning = false
         errorMessage = "The audio route changed. Reconnecting automatically…"
         statusMessage = "Reconnecting…"
-        scheduleRecovery(for: activeSession, delay: .milliseconds(350))
+        // Connecting a Bluetooth device fires a burst of changes; rebuild once it settles.
+        scheduleRecovery(for: activeSession, delay: .milliseconds(750))
     }
 
     private func installHardwarePropertyListener() {
@@ -469,43 +436,30 @@ final class AudioEngineController: ObservableObject {
         routeGeneration = UUID()
         pendingRouteChange = false
         inputWatchdogs.removeAll()
-        removeConfigurationObservers()
         meterTimer?.invalidate()
         meterTimer = nil
         for nodeID in recorderTapNodeIDs {
             recorderNodesByNodeID[nodeID]?.removeTap(onBus: 0)
         }
         recorderTapNodeIDs.removeAll()
-        if hasInputTap {
-            engine.inputNode.removeTap(onBus: 0)
-            hasInputTap = false
+        // Stop every callback that can render the graph before the engine goes away.
+        renderPump?.invalidate()
+        renderPump = nil
+        for unit in halInputUnits + halOutputUnits {
+            unit.stop()
         }
-        if hasOutputTap {
-            if processingEngineOutputActive {
-                engine.mainMixerNode.removeTap(onBus: 0)
-            } else {
-                outputEngine.mainMixerNode.removeTap(onBus: 0)
-            }
-            hasOutputTap = false
-        }
-        hardwareInputActive = false
+        halInputUnits.removeAll()
+        halOutputUnits.removeAll()
         for capture in screenAudioCaptureSources {
             capture.stop()
         }
         screenAudioCaptureSources.removeAll()
         engine.stop()
-        outputEngine.stop()
-        for inputEngine in additionalInputEngines {
-            inputEngine.stop()
-            inputEngine.reset()
-        }
-        for additionalOutputEngine in additionalOutputEngines {
-            additionalOutputEngine.stop()
-            additionalOutputEngine.reset()
+        for terminal in renderTerminals {
+            terminal.invalidate()
         }
         finishRecorderWriters()
         engine.reset()
-        outputEngine.reset()
         for audioUnit in hostedUnits.values
         where engine.attachedNodes.contains(audioUnit) {
             engine.detach(audioUnit)
@@ -513,13 +467,6 @@ final class AudioEngineController: ObservableObject {
         for audioUnit in hostedAECUnits.values
         where engine.attachedNodes.contains(audioUnit) {
             engine.detach(audioUnit)
-        }
-        if let sinkNode, engine.attachedNodes.contains(sinkNode) {
-            engine.detach(sinkNode)
-        }
-        if let auxiliarySinkNode,
-           engine.attachedNodes.contains(auxiliarySinkNode) {
-            engine.detach(auxiliarySinkNode)
         }
         if let auxiliaryMixerNode,
            engine.attachedNodes.contains(auxiliaryMixerNode) {
@@ -541,70 +488,24 @@ final class AudioEngineController: ObservableObject {
         where engine.attachedNodes.contains(source) {
             engine.detach(source)
         }
-        if let inputAdapterNode,
-           engine.attachedNodes.contains(inputAdapterNode) {
-            engine.detach(inputAdapterNode)
-        }
         for recorderNode in recorderNodesByNodeID.values
         where engine.attachedNodes.contains(recorderNode) {
             engine.detach(recorderNode)
         }
-        if let sourceNode, outputEngine.attachedNodes.contains(sourceNode) {
-            outputEngine.detach(sourceNode)
-        }
-        inputAdapterNode = nil
-        sinkNode = nil
-        auxiliarySinkNode = nil
+        renderTerminals.removeAll()
         auxiliaryMixerNode = nil
-        sourceNode = nil
         additionalInputSourceNodes.removeAll()
-        additionalInputEngines.removeAll()
-        additionalOutputEngines.removeAll()
         hostedOutputMixers.removeAll()
-        bridgeBuffer = nil
         hostedBuiltInNodes.removeAll()
         hostedCombineMixers.removeAll()
         hostedCombineInputNodes.removeAll()
         recorderNodesByNodeID.removeAll()
         activeRecorderNodeIDs.removeAll()
         engine = AVAudioEngine()
-        outputEngine = AVAudioEngine()
-        outputEngineActive = false
-        processingEngineOutputActive = false
         routeDescription = nil
         inputLevelDB = -96
         processedLevelDB = -96
         outputLevelDB = -96
-    }
-
-    private func installConfigurationObservers() {
-        removeConfigurationObservers()
-        let observedEngines = outputEngineActive
-            ? [engine, outputEngine]
-                + additionalInputEngines
-                + additionalOutputEngines
-            : [engine] + additionalInputEngines + additionalOutputEngines
-        let generation = routeGeneration
-        for observedEngine in observedEngines {
-            let observer = NotificationCenter.default.addObserver(
-                forName: .AVAudioEngineConfigurationChange,
-                object: observedEngine,
-                queue: .main
-            ) { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    guard let self, self.routeGeneration == generation else { return }
-                    self.handleUnexpectedConfigurationChange()
-                }
-            }
-            configurationObservers.append(observer)
-        }
-    }
-
-    private func removeConfigurationObservers() {
-        for observer in configurationObservers {
-            NotificationCenter.default.removeObserver(observer)
-        }
-        configurationObservers.removeAll()
     }
 
     private func friendlyError(_ error: Error) -> String {
@@ -886,10 +787,6 @@ final class AudioEngineController: ObservableObject {
         let outputNodeModels = plan.outputs
 
         engine = AVAudioEngine()
-        outputEngine = AVAudioEngine()
-        outputEngineActive = false
-        processingEngineOutputActive = false
-        hardwareInputActive = false
         discardHostedUnitsMissing(from: session)
         let generation = audioUnitGeneration
 
@@ -926,32 +823,34 @@ final class AudioEngineController: ObservableObject {
             throw AudioGraphError.invalidInputFormat
         }
 
-        let inputHardwareFormat: AVAudioFormat
-        if let primaryInput = resolvedInputs.first {
+        // One capture unit per physical device, opened now so its native format can
+        // steer format negotiation. Each forwards to a consumer wired up further down.
+        var inputCaptures: [
+            String: (consumer: HALInputConsumer, unit: HALAudioUnit)
+        ] = [:]
+        for input in resolvedInputs where inputCaptures[input.device.uid] == nil {
+            let consumer = HALInputConsumer()
+            let unit: HALAudioUnit
             do {
-                try engine.inputNode.auAudioUnit.setDeviceID(
-                    primaryInput.device.id
+                unit = try HALAudioUnit.input(
+                    deviceID: input.device.id,
+                    handler: consumer.handle
                 )
-                guard engine.inputNode.auAudioUnit.deviceID
-                    == primaryInput.device.id else {
-                    throw AudioGraphError.routeVerificationFailed
-                }
-            } catch let error as AudioGraphError {
-                throw error
             } catch {
                 throw AudioGraphError.deviceSelection(
                     role: "input",
-                    name: primaryInput.node.subtitle,
+                    name: input.node.subtitle,
                     detail: error.localizedDescription
                 )
             }
+            inputCaptures[input.device.uid] = (consumer, unit)
+            halInputUnits.append(unit)
+        }
 
-            inputHardwareFormat = engine.inputNode.outputFormat(forBus: 0)
-            guard inputHardwareFormat.channelCount > 0,
-                  inputHardwareFormat.sampleRate > 0 else {
-                throw AudioGraphError.invalidInputFormat
-            }
-            hardwareInputActive = true
+        let inputHardwareFormat: AVAudioFormat
+        if let primaryInput = resolvedInputs.first,
+           let format = inputCaptures[primaryInput.device.uid]?.unit.format {
+            inputHardwareFormat = format
         } else {
             inputHardwareFormat = screenCaptureFormat
         }
@@ -975,35 +874,18 @@ final class AudioEngineController: ObservableObject {
             )
         }
         let outputHardwareFormat: AVAudioFormat
-        let primaryOutputUsesProcessingEngine =
-            resolvedInputs.isEmpty && !resolvedOutputs.isEmpty
         if let primaryOutput = resolvedOutputs.first {
-            do {
-                let outputNode = primaryOutputUsesProcessingEngine
-                    ? engine.outputNode
-                    : outputEngine.outputNode
-                try outputNode.auAudioUnit.setDeviceID(
-                    primaryOutput.device.id
-                )
-                guard outputNode.auAudioUnit.deviceID
-                    == primaryOutput.device.id else {
-                    throw AudioGraphError.routeVerificationFailed
-                }
-            } catch let error as AudioGraphError {
-                throw error
-            } catch {
+            guard let format = AudioDeviceCatalog.nominalFormat(
+                primaryOutput.device.id,
+                scope: kAudioObjectPropertyScopeOutput
+            ) else {
                 throw AudioGraphError.deviceSelection(
                     role: "output",
                     name: primaryOutput.node.subtitle,
-                    detail: error.localizedDescription
+                    detail: "Core Audio did not report a usable output format."
                 )
             }
-            let outputNode = primaryOutputUsesProcessingEngine
-                ? engine.outputNode
-                : outputEngine.outputNode
-            outputHardwareFormat = outputNode.inputFormat(
-                forBus: 0
-            )
+            outputHardwareFormat = format
             routeDescription =
                 "\(plan.inputs.map(\.subtitle).joined(separator: " + ")) → \(outputNodeModels.map(\.subtitle).joined(separator: " + "))"
         } else {
@@ -1126,50 +1008,49 @@ final class AudioEngineController: ObservableObject {
             )
         }
 
+        try engine.enableManualRenderingMode(
+            .realtime,
+            format: processingFormat,
+            maximumFrameCount: 4_096
+        )
+        guard let pump = ManualRenderPump(engine: engine) else {
+            throw AudioGraphError.invalidInputFormat
+        }
+        renderPump = pump
+
         var engineNodes: [String: AVAudioNode] = [:]
         var sourceByDeviceUID: [String: AVAudioNode] = [:]
-        if let primaryInput = resolvedInputs.first {
-            let inputAdapter = AVAudioMixerNode()
-            inputAdapterNode = inputAdapter
-            engine.attach(inputAdapter)
-            engine.connect(
-                engine.inputNode,
-                to: inputAdapter,
-                format: inputHardwareFormat
-            )
-            sourceByDeviceUID[primaryInput.device.uid] = inputAdapter
-
-            for input in resolvedInputs {
-                if let existingSource = sourceByDeviceUID[input.device.uid] {
-                    engineNodes[input.node.id] = existingSource
-                    continue
-                }
-                let source = try makeAdditionalInputSource(
-                    input.node,
-                    device: input.device,
-                    format: processingFormat
-                )
-                sourceByDeviceUID[input.device.uid] = source
-                engineNodes[input.node.id] = source
+        for (index, input) in resolvedInputs.enumerated() {
+            if let existingSource = sourceByDeviceUID[input.device.uid] {
+                engineNodes[input.node.id] = existingSource
+                continue
             }
+            guard let capture = inputCaptures[input.device.uid] else {
+                throw AudioGraphError.invalidConnection
+            }
+            let source = try makeHardwareInputSource(
+                consumer: capture.consumer,
+                unit: capture.unit,
+                format: processingFormat,
+                drivesGraph: index == 0
+            )
+            sourceByDeviceUID[input.device.uid] = source
+            engineNodes[input.node.id] = source
         }
 
-        for input in screenInputModels {
+        for (index, input) in screenInputModels.enumerated() {
             statusMessage = "Connecting \(input.title)…"
-            let generation = routeGeneration
+            // Without a hardware input, the first capture clocks the graph instead.
+            let clock = resolvedInputs.isEmpty && index == 0 ? pump : nil
             let capture = ScreenAudioCaptureSource(
                 format: processingFormat,
-                failureHandler: { [weak self] in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.routeGeneration == generation else { return }
-                        self.handleUnexpectedConfigurationChange()
-                    }
-                }
+                failureHandler: routeFailureHandler()
             ) { [levelProbe] inputData, frameCount in
                 levelProbe.updateInput(
                     inputData,
                     frameCount: frameCount
                 )
+                clock?.render(frameCount)
             }
             engine.attach(capture.sourceNode)
             screenAudioCaptureSources.append(capture)
@@ -1343,11 +1224,22 @@ final class AudioEngineController: ObservableObject {
         }
 
         let probe = levelProbe
-        var renderEnginesByUID: [String: AVAudioEngine] = [:]
-        var nextMixerBusByUID: [String: AVAudioNodeBus] = [:]
-        if let primaryOutput = resolvedOutputs.first,
-           !primaryOutputUsesProcessingEngine {
-            renderEnginesByUID[primaryOutput.device.uid] = outputEngine
+        let mainMixer = engine.mainMixerNode
+        func attachTerminal(
+            after node: AVAudioNode,
+            handler: @escaping (UnsafePointer<AudioBufferList>, AVAudioFrameCount) -> Void
+        ) {
+            let terminal = RenderTerminal(handler: handler)
+            renderTerminals.append(terminal)
+            engine.attach(terminal.node)
+            engine.connect(node, to: terminal.node, format: processingFormat)
+            engine.connect(
+                terminal.node,
+                to: mainMixer,
+                fromBus: 0,
+                toBus: mainMixer.nextAvailableInputBus,
+                format: processingFormat
+            )
         }
 
         for (index, resolvedOutput) in resolvedOutputs.enumerated() {
@@ -1356,148 +1248,72 @@ final class AudioEngineController: ObservableObject {
             ] else {
                 throw AudioGraphError.invalidConnection
             }
-            if primaryOutputUsesProcessingEngine,
-               resolvedOutput.device.uid == resolvedOutputs.first?.device.uid {
-                let gainMixer = AVAudioMixerNode()
-                engine.attach(gainMixer)
-                engine.connect(
-                    outputGraphNode,
-                    to: gainMixer,
-                    format: processingFormat
+            let deviceChannels = AudioDeviceCatalog.channelCount(
+                resolvedOutput.device.id,
+                scope: kAudioObjectPropertyScopeOutput
+            )
+            // Mono is duplicated by the ring buffer; wider devices get the first channels.
+            guard deviceChannels > 0,
+                  let deviceFormat = AVAudioFormat(
+                    commonFormat: .pcmFormatFloat32,
+                    sampleRate: processingFormat.sampleRate,
+                    channels: AVAudioChannelCount(min(
+                        deviceChannels,
+                        Int(max(processingFormat.channelCount, 2))
+                    )),
+                    interleaved: false
+                  ) else {
+                throw AudioGraphError.deviceSelection(
+                    role: "output",
+                    name: resolvedOutput.node.subtitle,
+                    detail: "Core Audio did not report any output channels."
                 )
-                let mixerBus = nextMixerBusByUID[
-                    resolvedOutput.device.uid,
-                    default: 0
-                ]
-                engine.connect(
-                    gainMixer,
-                    to: engine.mainMixerNode,
-                    fromBus: 0,
-                    toBus: mixerBus,
-                    format: processingFormat
-                )
-                nextMixerBusByUID[resolvedOutput.device.uid] = mixerBus + 1
-                gainMixer.outputVolume = Float(
-                    resolvedOutput.node.gain
-                )
-                hostedOutputMixers[
-                    resolvedOutput.node.id
-                ] = gainMixer
-                continue
             }
 
             let bridge = AudioRingBuffer(
-                channelCount: Int(processingFormat.channelCount)
+                channelCount: Int(processingFormat.channelCount),
+                maximumLatencyFrames: Int(processingFormat.sampleRate * 0.2)
             )
-            let outputSink = AVAudioSinkNode { _, frameCount, inputData in
-                bridge.write(inputData, frameCount: frameCount)
-                if index == 0 {
-                    probe.updateProcessed(
-                        inputData,
-                        frameCount: frameCount
-                    )
-                }
-                return noErr
-            }
-            engine.attach(outputSink)
+            let gainMixer = AVAudioMixerNode()
+            engine.attach(gainMixer)
             engine.connect(
                 outputGraphNode,
-                to: outputSink,
-                format: processingFormat
-            )
-
-            let source = AVAudioSourceNode(
-                format: processingFormat
-            ) { isSilence, _, frameCount, outputData in
-                let hasAudio = bridge.read(
-                    into: outputData,
-                    frameCount: frameCount
-                )
-                isSilence.pointee = ObjCBool(!hasAudio)
-                return noErr
-            }
-            let renderEngine: AVAudioEngine
-            if let existing = renderEnginesByUID[
-                resolvedOutput.device.uid
-            ] {
-                renderEngine = existing
-            } else {
-                let additionalEngine = AVAudioEngine()
-                do {
-                    try additionalEngine.outputNode.auAudioUnit.setDeviceID(
-                        resolvedOutput.device.id
-                    )
-                    guard additionalEngine.outputNode.auAudioUnit.deviceID
-                        == resolvedOutput.device.id else {
-                        throw AudioGraphError.routeVerificationFailed
-                    }
-                } catch let error as AudioGraphError {
-                    throw error
-                } catch {
-                    throw AudioGraphError.deviceSelection(
-                        role: "output",
-                        name: resolvedOutput.node.subtitle,
-                        detail: error.localizedDescription
-                    )
-                }
-                renderEnginesByUID[
-                    resolvedOutput.device.uid
-                ] = additionalEngine
-                additionalOutputEngines.append(additionalEngine)
-                renderEngine = additionalEngine
-            }
-
-            if index == 0 {
-                sinkNode = outputSink
-                bridgeBuffer = bridge
-                sourceNode = source
-            }
-
-            let gainMixer = AVAudioMixerNode()
-            renderEngine.attach(source)
-            renderEngine.attach(gainMixer)
-            renderEngine.connect(
-                source,
                 to: gainMixer,
                 format: processingFormat
             )
-            let mixerBus = nextMixerBusByUID[
-                resolvedOutput.device.uid,
-                default: 0
-            ]
-            renderEngine.connect(
-                gainMixer,
-                to: renderEngine.mainMixerNode,
-                fromBus: 0,
-                toBus: mixerBus,
-                format: processingFormat
-            )
-            nextMixerBusByUID[resolvedOutput.device.uid] = mixerBus + 1
-            gainMixer.outputVolume = Float(
-                resolvedOutput.node.gain
-            )
-            hostedOutputMixers[
-                resolvedOutput.node.id
-            ] = gainMixer
-        }
+            gainMixer.outputVolume = Float(resolvedOutput.node.gain)
+            hostedOutputMixers[resolvedOutput.node.id] = gainMixer
+            attachTerminal(after: gainMixer) { data, frameCount in
+                bridge.write(data, frameCount: frameCount)
+                if index == 0 {
+                    probe.updateProcessed(data, frameCount: frameCount)
+                }
+            }
 
-        if primaryOutputUsesProcessingEngine {
-            engine.connect(
-                engine.mainMixerNode,
-                to: engine.outputNode,
-                format: nil
-            )
+            let watchdog = AudioCallbackWatchdog()
+            inputWatchdogs.append(watchdog)
+            let unit: HALAudioUnit
+            do {
+                unit = try HALAudioUnit.output(
+                    deviceID: resolvedOutput.device.id,
+                    format: deviceFormat
+                ) { data, frameCount in
+                    if frameCount > 0 { watchdog.recordCallback() }
+                    bridge.read(into: data, frameCount: frameCount)
+                    if index == 0 {
+                        probe.updateOutput(data, frameCount: frameCount)
+                    }
+                }
+            } catch {
+                throw AudioGraphError.deviceSelection(
+                    role: "output",
+                    name: resolvedOutput.node.subtitle,
+                    detail: error.localizedDescription
+                )
+            }
+            unit.observeDeviceChanges(routeFailureHandler())
+            halOutputUnits.append(unit)
         }
-        for renderEngine in renderEnginesByUID.values {
-            renderEngine.connect(
-                renderEngine.mainMixerNode,
-                to: renderEngine.outputNode,
-                format: nil
-            )
-        }
-        processingEngineOutputActive = primaryOutputUsesProcessingEngine
-        outputEngineActive =
-            !primaryOutputUsesProcessingEngine && !resolvedOutputs.isEmpty
 
         let terminalRecorders = plan.nodes.filter { node in
             guard case .recorder = node.nodeType else { return false }
@@ -1520,90 +1336,73 @@ final class AudioEngineController: ObservableObject {
                     format: processingFormat
                 )
             }
-            if resolvedInputs.isEmpty && resolvedOutputs.isEmpty {
-                engine.connect(
-                    collector,
-                    to: engine.mainMixerNode,
-                    format: processingFormat
-                )
-                engine.mainMixerNode.outputVolume = 0
-                engine.connect(
-                    engine.mainMixerNode,
-                    to: engine.outputNode,
-                    format: nil
-                )
-                processingEngineOutputActive = true
-            } else {
-                let nullSink = AVAudioSinkNode { _, frameCount, inputData in
-                    if resolvedOutputs.isEmpty {
-                        probe.updateProcessed(
-                            inputData,
-                            frameCount: frameCount
-                        )
-                    }
-                    return noErr
+            attachTerminal(after: collector) { data, frameCount in
+                if resolvedOutputs.isEmpty {
+                    probe.updateProcessed(data, frameCount: frameCount)
                 }
-                auxiliarySinkNode = nullSink
-                engine.attach(nullSink)
-                engine.connect(
-                    collector,
-                    to: nullSink,
-                    format: processingFormat
-                )
             }
         }
+
+        // Every endpoint feeds this muted mixer, so one manual render pulls the whole graph.
+        mainMixer.outputVolume = 0
+        engine.connect(mainMixer, to: engine.outputNode, format: processingFormat)
 
         sampleRate = processingFormat.sampleRate
-        installSignalTaps()
     }
 
-    private func makeAdditionalInputSource(
-        _ node: AudioNode,
-        device: (id: AudioObjectID, uid: String),
-        format: AVAudioFormat
+    /// Bridges one capture unit into the graph. The primary input also clocks the graph:
+    /// it renders right after each write, so its own audio adds no buffering delay.
+    private func makeHardwareInputSource(
+        consumer: HALInputConsumer,
+        unit: HALAudioUnit,
+        format: AVAudioFormat,
+        drivesGraph: Bool
     ) throws -> AVAudioSourceNode {
-        let captureEngine = AVAudioEngine()
-        do {
-            try captureEngine.inputNode.auAudioUnit.setDeviceID(device.id)
-            guard captureEngine.inputNode.auAudioUnit.deviceID
-                == device.id else {
-                throw AudioGraphError.routeVerificationFailed
-            }
-        } catch let error as AudioGraphError {
-            throw error
-        } catch {
-            throw AudioGraphError.deviceSelection(
-                role: "input",
-                name: node.subtitle,
-                detail: error.localizedDescription
-            )
-        }
-
-        let hardwareFormat = captureEngine.inputNode.outputFormat(forBus: 0)
-        guard hardwareFormat.channelCount > 0,
-              hardwareFormat.sampleRate > 0 else {
-            throw AudioGraphError.invalidInputFormat
-        }
-
         let bridge = AudioRingBuffer(
-            channelCount: Int(format.channelCount)
+            channelCount: Int(format.channelCount),
+            maximumLatencyFrames: drivesGraph
+                ? nil
+                : Int(format.sampleRate * 0.2)
         )
-        let adapter = AVAudioMixerNode()
+        let clock = drivesGraph ? renderPump : nil
+        let deliver: (UnsafePointer<AudioBufferList>, AVAudioFrameCount) -> Void = {
+            data, frameCount in
+            bridge.write(data, frameCount: frameCount)
+            clock?.render(frameCount)
+        }
+
+        // The ring buffer maps channels; only the sample rate may need converting.
+        let convert: (UnsafePointer<AudioBufferList>, AVAudioFrameCount) -> Void
+        if abs(unit.format.sampleRate - format.sampleRate) < 0.5 {
+            convert = deliver
+        } else {
+            guard let resampledFormat = AVAudioFormat(
+                    commonFormat: .pcmFormatFloat32,
+                    sampleRate: format.sampleRate,
+                    channels: unit.format.channelCount,
+                    interleaved: false
+                  ),
+                  let converter = TapPCMConverter(
+                    inputFormat: unit.format,
+                    outputFormat: resampledFormat,
+                    bufferHandler: deliver
+                  ) else {
+                throw AudioGraphError.invalidInputFormat
+            }
+            convert = { data, _ in converter.consume(data) }
+        }
+
         let watchdog = AudioCallbackWatchdog()
         inputWatchdogs.append(watchdog)
-        let sink = AVAudioSinkNode { _, frameCount, inputData in
+        let probe = levelProbe
+        consumer.handler = { data, frameCount in
             if frameCount > 0 { watchdog.recordCallback() }
-            bridge.write(inputData, frameCount: frameCount)
-            return noErr
+            if drivesGraph {
+                probe.updateInput(data, frameCount: frameCount)
+            }
+            convert(data, frameCount)
         }
-        captureEngine.attach(adapter)
-        captureEngine.attach(sink)
-        captureEngine.connect(
-            captureEngine.inputNode,
-            to: adapter,
-            format: hardwareFormat
-        )
-        captureEngine.connect(adapter, to: sink, format: format)
+        unit.observeDeviceChanges(routeFailureHandler())
 
         let source = AVAudioSourceNode(
             format: format
@@ -1616,9 +1415,19 @@ final class AudioEngineController: ObservableObject {
             return noErr
         }
         engine.attach(source)
-        additionalInputEngines.append(captureEngine)
         additionalInputSourceNodes.append(source)
         return source
+    }
+
+    /// Rebuilds the route if a device of the current generation fails.
+    private func routeFailureHandler() -> @Sendable () -> Void {
+        let generation = routeGeneration
+        return { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.routeGeneration == generation else { return }
+                self.handleUnexpectedConfigurationChange()
+            }
+        }
     }
 
     private func attachRecorder(
@@ -2056,44 +1865,6 @@ final class AudioEngineController: ObservableObject {
         return (deviceID, resolvedUID)
     }
 
-    private func installSignalTaps() {
-        let probe = levelProbe
-        if hardwareInputActive {
-            let watchdog = AudioCallbackWatchdog()
-            inputWatchdogs.append(watchdog)
-            engine.inputNode.installTap(
-                onBus: 0,
-                bufferSize: 1024,
-                format: nil
-            ) { buffer, _ in
-                if buffer.frameLength > 0 { watchdog.recordCallback() }
-                probe.updateInput(buffer)
-            }
-            hasInputTap = true
-        }
-
-        if processingEngineOutputActive {
-            engine.mainMixerNode.installTap(
-                onBus: 0,
-                bufferSize: 1024,
-                format: nil
-            ) { buffer, _ in
-                probe.updateProcessed(buffer)
-                probe.updateOutput(buffer)
-            }
-            hasOutputTap = true
-        } else if outputEngineActive {
-            outputEngine.mainMixerNode.installTap(
-                onBus: 0,
-                bufferSize: 1024,
-                format: nil
-            ) { buffer, _ in
-                probe.updateOutput(buffer)
-            }
-            hasOutputTap = true
-        }
-    }
-
     private func startMeterUpdates() {
         meterTimer?.invalidate()
         meterTimer = Timer.scheduledTimer(
@@ -2105,11 +1876,9 @@ final class AudioEngineController: ObservableObject {
                 let levels = self.levelProbe.levels()
                 self.inputLevelDB = levels.input
                 self.processedLevelDB = levels.processed
-                self.outputLevelDB =
-                    (self.processingEngineOutputActive
-                     || self.outputEngineActive)
-                    ? levels.output
-                    : levels.processed
+                self.outputLevelDB = self.halOutputUnits.isEmpty
+                    ? levels.processed
+                    : levels.output
                 for (nodeID, writer) in self.recorderWritersByNodeID {
                     let snapshot = writer.snapshot()
                     self.recordedDurationByNodeID[nodeID] = snapshot.duration
@@ -2125,15 +1894,7 @@ final class AudioEngineController: ObservableObject {
                 if self.isFlowEnabled,
                    self.isRunning,
                    (self.inputWatchdogs.contains { $0.isStalled() }
-                    || !self.engine.isRunning
-                    || (self.outputEngineActive
-                        && !self.outputEngine.isRunning)
-                    || self.additionalInputEngines.contains {
-                        !$0.isRunning
-                    }
-                    || self.additionalOutputEngines.contains {
-                        !$0.isRunning
-                    }) {
+                    || !self.engine.isRunning) {
                     self.handleUnexpectedConfigurationChange()
                 }
             }
@@ -2759,6 +2520,19 @@ private enum AudioGraphError: LocalizedError {
     }
 }
 
+/// Lets a capture unit open, and report its format, before its graph destination exists.
+private final class HALInputConsumer: @unchecked Sendable {
+    // Assigned before the unit starts; never changed while it runs.
+    var handler: ((UnsafePointer<AudioBufferList>, AVAudioFrameCount) -> Void)?
+
+    func handle(
+        _ data: UnsafeMutablePointer<AudioBufferList>,
+        _ frameCount: AVAudioFrameCount
+    ) {
+        handler?(data, frameCount)
+    }
+}
+
 private final class AudioLevelProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var inputDB: Double = -96
@@ -2786,6 +2560,17 @@ private final class AudioLevelProbe: @unchecked Sendable {
 
     func updateOutput(_ buffer: AVAudioPCMBuffer) {
         update(buffer, destination: \.outputDB)
+    }
+
+    func updateOutput(
+        _ outputData: UnsafePointer<AudioBufferList>,
+        frameCount: AVAudioFrameCount
+    ) {
+        update(
+            outputData,
+            frameCount: frameCount,
+            destination: \.outputDB
+        )
     }
 
     func updateProcessed(

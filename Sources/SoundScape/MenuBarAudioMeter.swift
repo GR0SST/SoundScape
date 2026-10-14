@@ -10,11 +10,36 @@ final class MenuBarAudioMeter: ObservableObject {
     private var timer: Timer?
     private var visible = true
     private var phase: Double = 0
+    private var isMenuTracking = false
+    private var menuObservers: [NSObjectProtocol] = []
+
+    init() {
+        // Redrawing the status item while its menu is open rebuilds the menu under the
+        // user's click, which crashed inside SwiftUI's menu item callback.
+        let center = NotificationCenter.default
+        menuObservers = [
+            center.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.setMenuTracking(true) }
+            },
+            center.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.setMenuTracking(false) }
+            }
+        ]
+    }
+
+    private func setMenuTracking(_ tracking: Bool) {
+        isMenuTracking = tracking
+        if tracking {
+            stopTimer()
+        } else {
+            setLevel(target * 52 - 60)
+        }
+    }
 
     func setLevel(_ decibels: Double) {
         // Ignore the noise floor and give ordinary speech a useful visual range.
         target = decibels.isFinite ? min(max((decibels + 60) / 52, 0), 1) : 0
-        guard visible else { return }
+        guard visible, !isMenuTracking else { return }
         if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
             stopTimer()
             level = target
@@ -38,7 +63,7 @@ final class MenuBarAudioMeter: ObservableObject {
     }
 
     private func tick() {
-        guard visible else { stopTimer(); return }
+        guard visible, !isMenuTracking else { stopTimer(); return }
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         // Fast attack, slower release: voice peaks react quickly without flicker.
         level += (target - level) * (target > level ? 0.65 : 0.18)
@@ -54,7 +79,12 @@ final class MenuBarAudioMeter: ObservableObject {
         timer = nil
     }
 
-    deinit { timer?.invalidate() }
+    deinit {
+        timer?.invalidate()
+        for observer in menuObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
 
     private static func makeImage(level: Double, phase: Double) -> NSImage {
         let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { rect in

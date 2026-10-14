@@ -9,10 +9,21 @@ final class AudioRingBuffer: @unchecked Sendable {
     private var readIndex = 0
     private var writeIndex = 0
     private var availableFrames = 0
+    private let maximumLatencyFrames: Int?
 
-    init(channelCount: Int, capacity: Int = 96_000) {
+    /// `maximumLatencyFrames` bounds the delay between two device clocks. Without it, one
+    /// stall or slow clock drift leaves up to `capacity` frames (2 s) of permanent lag.
+    init(
+        channelCount: Int,
+        capacity: Int = 96_000,
+        maximumLatencyFrames: Int? = nil
+    ) {
+        let capacity = max(capacity, 4_096)
         self.channelCount = max(channelCount, 1)
-        self.capacity = max(capacity, 4_096)
+        self.capacity = capacity
+        self.maximumLatencyFrames = maximumLatencyFrames.map {
+            min(max($0, 2_048), capacity)
+        }
         storage = Array(
             repeating: Array(repeating: 0, count: self.capacity),
             count: self.channelCount
@@ -72,6 +83,13 @@ final class AudioRingBuffer: @unchecked Sendable {
             }
             writeIndex = (writeIndex + 1) % capacity
             availableFrames += 1
+        }
+
+        // Skip to half the limit so a drifting clock trims rarely instead of every write.
+        if let maximumLatencyFrames, availableFrames > maximumLatencyFrames {
+            let dropped = availableFrames - maximumLatencyFrames / 2
+            readIndex = (readIndex + dropped) % capacity
+            availableFrames -= dropped
         }
     }
 
